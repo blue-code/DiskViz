@@ -12,6 +12,7 @@ echo ""
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration
@@ -22,14 +23,15 @@ DMG_TITLE="DiskViz ${VERSION}"
 
 # Step 1: Clean previous builds
 echo -e "${BLUE}[1/5]${NC} Cleaning previous builds..."
-rm -rf build dist
+rm -rf build dist *.egg-info
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 echo "✓ Cleaned"
 echo ""
 
 # Step 2: Check for py2app
 echo -e "${BLUE}[2/5]${NC} Checking dependencies..."
 if ! python3 -c "import py2app" 2>/dev/null; then
-    echo "Installing py2app..."
+    echo -e "${YELLOW}Installing py2app...${NC}"
     pip3 install py2app
 fi
 echo "✓ Dependencies OK"
@@ -37,7 +39,11 @@ echo ""
 
 # Step 3: Build the .app bundle
 echo -e "${BLUE}[3/5]${NC} Building .app bundle..."
-python3 setup.py py2app
+echo -e "${YELLOW}This may take a few minutes...${NC}"
+if ! python3 setup.py py2app 2>&1 | grep -v "DeprecatedInstaller" | grep -v "fetch_build_eggs"; then
+    echo -e "${RED}✗ Build failed${NC}"
+    exit 1
+fi
 echo "✓ App bundle created"
 echo ""
 

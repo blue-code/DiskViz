@@ -8,7 +8,49 @@ APP = ['diskviz/__main__.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
-    'packages': ['tkinter', 'pathlib'],
+    'packages': ['diskviz'],
+    'includes': [
+        'tkinter',
+        'tkinter.filedialog',
+        'tkinter.messagebox',
+        'tkinter.ttk',
+    ],
+    'excludes': [
+        'numpy',
+        'scipy',
+        'matplotlib',
+        'pandas',
+        'PIL',
+        'setuptools',
+        'distutils',
+        'test',
+        'unittest',
+        'email',
+        'html',
+        'http',
+        'urllib',
+        'xml',
+        'xmlrpc',
+        'pydoc',
+        'doctest',
+        'argparse',
+        'difflib',
+        'inspect',
+        'pdb',
+        'bdb',
+        'cmd',
+        'code',
+        'codeop',
+        'py_compile',
+        'compileall',
+        'dis',
+        'pickletools',
+        'sqlite3',
+        'multiprocessing',
+        'concurrent',
+        'asyncio',
+        'ctypes',
+    ],
     'iconfile': None,  # Add an .icns file path here if you have one
     'plist': {
         'CFBundleName': 'DiskViz',
@@ -19,7 +61,9 @@ OPTIONS = {
         'CFBundleShortVersionString': '1.0.0',
         'NSHumanReadableCopyright': 'Copyright © 2025. All rights reserved.',
         'NSHighResolutionCapable': True,
-    }
+    },
+    'strip': True,  # Strip debug symbols
+    'optimize': 2,  # Optimize bytecode
 }
 
 setup(
