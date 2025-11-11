@@ -1,2 +1,11 @@
 __pycache__/
 *.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+dmg_tmp/
+
+# macOS
+.DS_Store

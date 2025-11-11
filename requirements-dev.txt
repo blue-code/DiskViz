@@ -1,0 +1,4 @@
+# Development and Build Dependencies for DiskViz
+
+# macOS app bundling
+py2app>=0.28.6

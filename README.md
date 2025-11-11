@@ -10,6 +10,9 @@ DiskViz is a Python implementation of a SpaceSniffer-like disk usage explorer. I
 - 🔍 **Search & filter** – instant highlighting plus an option to hide non-matching nodes.
 - 🗑️ **Deletion support** – delete files or entire directories (with confirmation) directly from the UI.
 - 🛠️ **Advanced controls** – adjustable scan depth, optional symlink following, and a legend to keep colors straight.
+- 🧭 **Navigation** – double-click to drill down into directories, backspace to go up, keyboard shortcuts for quick access.
+- 📊 **Scan statistics** – see files/directories scanned and permission-denied folders.
+- 🔐 **Permission handling** – gracefully handles restricted folders on macOS with helpful guidance.
 
 ## Requirements
 
@@ -23,10 +26,73 @@ python -m diskviz
 
 1. Click **Browse** to choose a directory.
 2. Adjust scan depth or enable symlink following if needed.
-3. Use the search box to highlight matches; enable **Hide non-matching** to filter the view.
-4. Select any rectangle to see its details in the status bar. Use **Delete Selected** to remove it.
+3. **Double-click** any directory to drill down and focus on that folder.
+4. Use **Up ↑** button or **Backspace** to navigate to parent directory.
+5. Use **Reset** button or **Home** key to return to the scanned root.
+6. Use the search box to highlight matches; enable **Hide non-matching** to filter the view.
+7. Select any rectangle to see its details. Use **Delete** button or **Delete** key to remove it.
+
+### Keyboard Shortcuts
+
+- `F5` - Rescan current directory
+- `F11` - Toggle fullscreen mode
+- `Delete` - Delete selected item
+- `Backspace` - Go up one level
+- `Home` - Reset to root view
+- `Escape` - Exit fullscreen or clear selection
+- `Ctrl+Q` - Quit application
 
 > ⚠️ **Deletion is permanent.** Ensure you have backups before deleting files.
+
+## macOS Permissions
+
+On macOS, you may encounter permission issues when scanning certain directories (Documents, Desktop, etc.). DiskViz will:
+- Continue scanning accessible folders
+- Show statistics about permission-denied folders
+- Display a helpful dialog with macOS-specific guidance
+
+To grant full access on macOS:
+1. Open **System Settings** → **Privacy & Security**
+2. Click **Full Disk Access**
+3. Add **Terminal** (or your Python IDE)
+4. Restart Terminal and run DiskViz again
+
+Alternatively, scan directories that don't require special permissions (like `/Users/yourname/Downloads` or project folders).
+
+## Building macOS DMG
+
+To build a standalone macOS application and DMG installer:
+
+### Prerequisites
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+### Build
+
+```bash
+./build_dmg.sh
+```
+
+This will:
+1. Clean previous builds
+2. Create a `.app` bundle using py2app
+3. Generate a DMG installer
+4. Output files to `dist/` directory
+
+### Output
+
+- `dist/DiskViz.app` - macOS application bundle
+- `dist/DiskViz-1.0.0.dmg` - DMG installer
+
+### Installation
+
+1. Open the generated DMG file
+2. Drag `DiskViz.app` to your Applications folder
+3. Launch from Applications or Spotlight
+
+> **Note**: On first launch, you may need to right-click the app and select "Open" to bypass Gatekeeper, or go to System Settings → Privacy & Security and allow the app.
 
 ## Development Notes
 

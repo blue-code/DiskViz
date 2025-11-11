@@ -10,12 +10,28 @@ from .model import DiskNode
 
 @dataclass
 class Rect:
+    """Rectangle bounds for treemap layout.
+
+    Attributes:
+        x: Left edge coordinate
+        y: Top edge coordinate
+        width: Rectangle width
+        height: Rectangle height
+    """
     x: float
     y: float
     width: float
     height: float
 
     def inset(self, padding: float) -> "Rect":
+        """Create a new rectangle inset by padding on all sides.
+
+        Args:
+            padding: Amount to inset on each side
+
+        Returns:
+            New Rect with inset bounds
+        """
         return Rect(
             self.x + padding,
             self.y + padding,
@@ -26,6 +42,14 @@ class Rect:
 
 @dataclass
 class NodeRect:
+    """Represents a DiskNode with its treemap layout rectangle.
+
+    Attributes:
+        node: The filesystem node
+        rect: Layout rectangle for this node
+        depth: Tree depth of this node
+        parent: Parent DiskNode, if any
+    """
     node: DiskNode
     rect: Rect
     depth: int
@@ -35,8 +59,21 @@ class NodeRect:
 def slice_and_dice(
     node: DiskNode, bounds: Rect, depth: int = 0, parent: Optional[DiskNode] = None
 ) -> List[NodeRect]:
-    """Compute a treemap layout for *node* using the slice-and-dice algorithm."""
+    """Compute a treemap layout using the slice-and-dice algorithm.
 
+    This algorithm alternates between horizontal and vertical slicing
+    at each depth level, creating rectangular regions proportional
+    to file/directory sizes.
+
+    Args:
+        node: Root node to layout
+        bounds: Available rectangle bounds
+        depth: Current tree depth (controls slice direction)
+        parent: Parent node, if any
+
+    Returns:
+        List of NodeRect entries for the entire tree
+    """
     layouts: List[NodeRect] = [NodeRect(node=node, rect=bounds, depth=depth, parent=parent)]
     if not node.children or node.size <= 0:
         return layouts
@@ -67,8 +104,20 @@ def slice_and_dice(
 
 
 def filter_layout(layouts: Sequence[NodeRect], query: str) -> Iterable[NodeRect]:
-    """Yield layout entries that match the *query* or have matching descendants."""
+    """Yield layout entries matching the query or having matching descendants.
 
+    The filter includes:
+    - Nodes whose path contains the query string
+    - All ancestors of matching nodes (for context)
+    - All descendants of matching directories (for context)
+
+    Args:
+        layouts: Complete treemap layout to filter
+        query: Search query (case-insensitive)
+
+    Yields:
+        NodeRect entries that match or provide context
+    """
     if not query:
         yield from layouts
         return
