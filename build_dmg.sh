@@ -50,20 +50,30 @@ echo ""
 # Step 4: Create DMG
 echo -e "${BLUE}[4/5]${NC} Creating DMG installer..."
 
+# Verify app bundle exists
+if [ ! -d "dist/${APP_NAME}.app" ]; then
+    echo -e "${RED}✗ App bundle not found${NC}"
+    exit 1
+fi
+
 # Create temporary directory for DMG contents
 DMG_TMP="dmg_tmp"
+rm -rf "${DMG_TMP}"
 mkdir -p "${DMG_TMP}"
 
-# Copy app to temp directory
-cp -r "dist/${APP_NAME}.app" "${DMG_TMP}/"
+# Use ditto instead of cp for better macOS compatibility
+echo "Copying app bundle..."
+ditto "dist/${APP_NAME}.app" "${DMG_TMP}/${APP_NAME}.app"
 
 # Create Applications symlink
 ln -s /Applications "${DMG_TMP}/Applications"
 
-# Create DMG
+# Create DMG with better compression
+echo "Creating DMG file..."
 hdiutil create -volname "${DMG_TITLE}" \
     -srcfolder "${DMG_TMP}" \
     -ov -format UDZO \
+    -imagekey zlib-level=9 \
     "dist/${DMG_NAME}.dmg"
 
 # Clean up temp directory
