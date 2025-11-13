@@ -40,7 +40,7 @@ TEXT_COLOR = "#191919"
 NORMAL_LIGHTEN_FACTOR = 0.25
 SEARCH_LIGHTEN_FACTOR = 0.45
 DEPTH_SHADE_FACTOR = 0.06
-VISIBLE_DEPTH: Optional[int] = 2  # Show immediate children by default
+VISIBLE_DEPTH: Optional[int] = None  # Show entire hierarchy for richer treemap
 
 
 def check_directory_access(path: Path) -> tuple[bool, str]:
