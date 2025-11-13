@@ -72,6 +72,11 @@ pip install -r requirements-dev.txt
 ### Build
 
 ```bash
+# Uses the python/pip from your current shell.
+# If you need a specific interpreter, set PYTHON_BIN / PIP_BIN:
+#   PYTHON_BIN=/Users/you/miniconda3/bin/python \
+#   PIP_BIN=/Users/you/miniconda3/bin/pip \
+#   ./build_dmg.sh
 ./build_dmg.sh
 ```
 

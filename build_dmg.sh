@@ -5,7 +5,13 @@
 
 set -e  # Exit on error
 
+# Allow overriding python/pip binaries (useful when multiple versions are installed)
+PYTHON_BIN=${PYTHON_BIN:-python}
+PIP_BIN=${PIP_BIN:-pip}
+
 echo "🔨 Building DiskViz for macOS..."
+echo ""
+echo "Using Python interpreter: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
 echo ""
 
 # Colors for output
@@ -30,9 +36,9 @@ echo ""
 
 # Step 2: Check for py2app
 echo -e "${BLUE}[2/5]${NC} Checking dependencies..."
-if ! python3 -c "import py2app" 2>/dev/null; then
+if ! $PYTHON_BIN -c "import py2app" 2>/dev/null; then
     echo -e "${YELLOW}Installing py2app...${NC}"
-    pip3 install py2app
+    $PIP_BIN install py2app
 fi
 echo "✓ Dependencies OK"
 echo ""
@@ -40,7 +46,7 @@ echo ""
 # Step 3: Build the .app bundle
 echo -e "${BLUE}[3/5]${NC} Building .app bundle..."
 echo -e "${YELLOW}This may take a few minutes...${NC}"
-if ! python3 setup.py py2app 2>&1 | grep -v "DeprecatedInstaller" | grep -v "fetch_build_eggs"; then
+if ! $PYTHON_BIN setup.py py2app 2>&1 | grep -v "DeprecatedInstaller" | grep -v "fetch_build_eggs"; then
     echo -e "${RED}✗ Build failed${NC}"
     exit 1
 fi
