@@ -2,7 +2,10 @@
 Setup script for building DiskViz macOS application.
 """
 
+from pathlib import Path
 from setuptools import setup
+
+ICON_PATH = Path(__file__).parent / "assets" / "DiskViz.icns"
 
 APP = ['diskviz/__main__.py']
 DATA_FILES = []
@@ -27,7 +30,7 @@ OPTIONS = {
         'pandas',
         'PIL',
     ],
-    'iconfile': None,  # Add an .icns file path here if you have one
+    'iconfile': str(ICON_PATH) if ICON_PATH.exists() else None,
     'plist': {
         'CFBundleName': 'DiskViz',
         'CFBundleDisplayName': 'DiskViz',

@@ -91,6 +91,14 @@ This will:
 - `dist/DiskViz.app` - macOS application bundle
 - `dist/DiskViz-1.0.0.dmg` - DMG installer
 
+### Custom icon
+
+1. Save the desired PNG (512px or larger) as `assets/DiskViz.png`.
+2. Run `./scripts/make_icon.sh` on macOS to convert it into `assets/DiskViz.icns`.
+3. Re-run `./build_dmg.sh` and `./create_dmg_only.sh`.
+
+If the `.icns` file is missing the build still succeeds, but macOS will fall back to the default py2app icon.
+
 ### Installation
 
 1. Open the generated DMG file

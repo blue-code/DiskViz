@@ -8,11 +8,16 @@ set -e  # Exit on error
 # Allow overriding python/pip binaries (useful when multiple versions are installed)
 PYTHON_BIN=${PYTHON_BIN:-python}
 PIP_BIN=${PIP_BIN:-pip}
+ICON_FILE=${ICON_FILE:-assets/DiskViz.icns}
 
 echo "🔨 Building DiskViz for macOS..."
 echo ""
 echo "Using Python interpreter: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
 echo ""
+
+if [ ! -f "$ICON_FILE" ]; then
+    echo "⚠️ Custom icon not found at $ICON_FILE (default icon will be used)"
+fi
 
 # Colors for output
 GREEN='\033[0;32m'

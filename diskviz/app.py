@@ -191,6 +191,7 @@ class DiskVizApp:
 
         top_frame = ttk.Frame(self.root, padding=8)
         top_frame.pack(fill=tk.X)
+        self.top_frame = top_frame
 
         ttk.Label(top_frame, text="Directory:").grid(row=0, column=0, sticky="w")
         entry = ttk.Entry(top_frame, textvariable=self.path_var, width=50)
@@ -252,9 +253,11 @@ class DiskVizApp:
         self.tooltip_var = tk.StringVar(value="")
         tooltip = ttk.Label(self.root, textvariable=self.tooltip_var, relief=tk.GROOVE, anchor="w")
         tooltip.pack(fill=tk.X, side=tk.BOTTOM)
+        self.tooltip_label = tooltip
 
         status = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w")
         status.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_label = status
 
     def _setup_quick_access(self, parent: ttk.Frame) -> None:
         """Setup quick access menu for safe directories."""
@@ -338,12 +341,35 @@ select a different folder."""
         """Toggle fullscreen mode."""
         self.is_fullscreen = not self.is_fullscreen
         self.root.attributes("-fullscreen", self.is_fullscreen)
+        self._apply_canvas_only_layout()
 
         # Update status message
         if self.is_fullscreen:
             self.status_var.set("🖥️ Fullscreen mode (Press F11 or ESC to exit)")
         else:
             self.status_var.set("💡 Select a folder below or use Quick Access buttons for safe directories")
+
+    def _apply_canvas_only_layout(self) -> None:
+        """Show only the treemap canvas when fullscreen is enabled."""
+        if not hasattr(self, "top_frame"):
+            return
+
+        widgets = (self.top_frame, self.tooltip_label, self.status_label)
+        if self.is_fullscreen:
+            for widget in widgets:
+                if widget.winfo_ismapped():
+                    widget.pack_forget()
+            self.canvas.pack_forget()
+            self.canvas.pack(fill=tk.BOTH, expand=True)
+        else:
+            if not self.top_frame.winfo_ismapped():
+                self.top_frame.pack(fill=tk.X)
+            self.canvas.pack_forget()
+            self.canvas.pack(fill=tk.BOTH, expand=True)
+            if not self.tooltip_label.winfo_ismapped():
+                self.tooltip_label.pack(fill=tk.X, side=tk.BOTTOM)
+            if not self.status_label.winfo_ismapped():
+                self.status_label.pack(fill=tk.X, side=tk.BOTTOM)
 
     def _handle_escape(self) -> None:
         """Handle Escape key - exit fullscreen or clear selection."""
@@ -499,6 +525,22 @@ select a different folder."""
         self._schedule_monitor()
 
     # ------------------------------------------------------------------ drawing
+    def _truncate_label(self, text: str, max_length: int = 28) -> str:
+        """Truncate long labels so they fit better inside rectangles."""
+        return text if len(text) <= max_length else text[: max_length - 1] + "…"
+
+    def _format_node_label(self, node: DiskNode) -> str:
+        """Build the multi-line label displayed inside each rectangle."""
+        name = self._truncate_label(node.name or str(node.path))
+        size_text = format_size(node.size)
+        if node.is_dir:
+            display_name = f"{name or '/'}"
+            return f"{display_name}/\n{size_text}"
+        parent = node.path.parent
+        parent_name = parent.name or str(parent)
+        parent_display = self._truncate_label(parent_name or "/")
+        return f"{name}\n[{parent_display}]\n{size_text}"
+
     def redraw(self) -> None:
         """Redraw the treemap visualization on the canvas."""
         if self.current_node is None or self.is_drawing:
@@ -539,7 +581,7 @@ select a different folder."""
                 self.canvas_rects[item] = node
                 drawn = True
                 if rect.width > MIN_LABEL_WIDTH and rect.height > MIN_LABEL_HEIGHT:
-                    label = f"{node.name}\n{format_size(node.size)}"
+                    label = self._format_node_label(node)
                     # Use bold font for directories
                     font_spec = ("Segoe UI", 9, "bold") if node.is_dir else ("Segoe UI", 9)
                     self.canvas.create_text(
