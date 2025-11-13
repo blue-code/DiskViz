@@ -39,7 +39,6 @@ class Rect:
             max(0.0, self.height - 2 * padding),
         )
 
-
 @dataclass
 class NodeRect:
     """Represents a DiskNode with its treemap layout rectangle.

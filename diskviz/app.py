@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
 import shutil
 import subprocess
@@ -13,7 +14,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
-from .colors import FILE_TYPE_COLORS, color_for_node
 from .model import DiskNode
 from .scanner import ScanStats, flatten_snapshot, scan_directory
 from .treemap import NodeRect, Rect, filter_layout, slice_and_dice
@@ -24,22 +24,23 @@ DEFAULT_SCAN_DEPTH = 4
 MONITOR_INTERVAL_MS = 5000
 MAX_SCAN_QUEUE_SIZE = 2
 
-# Canvas constants
-CANVAS_BG_COLOR = "#202225"
-RECT_INSET_PADDING = 1.5
+# Canvas & palette constants (SpaceSniffer style)
+CANVAS_BG_COLOR = "#0E1018"
+RECT_INSET_PADDING = 1.0
 MIN_LABEL_WIDTH = 80
-MIN_LABEL_HEIGHT = 40
+MIN_LABEL_HEIGHT = 38
 
-# Color constants
-SELECTION_COLOR = "#FFD700"  # Gold
-SEARCH_MATCH_COLOR = "#00CED1"  # Dark turquoise
-DEFAULT_OUTLINE_COLOR = "#111"
-DIMMED_OUTLINE_COLOR = "#444"
-TEXT_COLOR = "#f5f5f5"
+DIR_TILE_BASE = "#C48B4A"
+FILE_TILE_BASE = "#4D90D5"
+SELECTION_COLOR = "#FFE066"
+SEARCH_MATCH_COLOR = "#47E2C1"
+DIMMED_OUTLINE_COLOR = "#2F3442"
+TEXT_COLOR = "#191919"
 
-# Lighten factors
-NORMAL_LIGHTEN_FACTOR = 0.35
-SEARCH_LIGHTEN_FACTOR = 0.55
+NORMAL_LIGHTEN_FACTOR = 0.25
+SEARCH_LIGHTEN_FACTOR = 0.45
+DEPTH_SHADE_FACTOR = 0.06
+VISIBLE_DEPTH: Optional[int] = 2  # Show immediate children by default
 
 
 def check_directory_access(path: Path) -> tuple[bool, str]:
@@ -149,6 +150,18 @@ def lighten(color: str, factor: float = NORMAL_LIGHTEN_FACTOR) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def darken(color: str, factor: float = 0.25) -> str:
+    """Darken a hex color by blending it with black."""
+    color = color.lstrip("#")
+    r = int(color[0:2], 16)
+    g = int(color[2:4], 16)
+    b = int(color[4:6], 16)
+    r = int(r * (1 - factor))
+    g = int(g * (1 - factor))
+    b = int(b * (1 - factor))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 class DiskVizApp:
     """Main application class providing disk usage visualization."""
 
@@ -164,21 +177,20 @@ class DiskVizApp:
         self.filter_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="💡 Select a folder below or use Quick Access buttons for safe directories")
 
-        self._setup_ui()
-
         self.current_node: Optional[DiskNode] = None
         self.root_node: Optional[DiskNode] = None  # Store original root for navigation
         self.current_layout: List[NodeRect] = []
         self.canvas_rects: Dict[int, DiskNode] = {}
         self.selection: Optional[DiskNode] = None
         self.snapshot_hash: Optional[int] = None
+
+        self._setup_ui()
         self.monitor_job: Optional[str] = None
         self.scan_queue: "queue.Queue[_PendingScan]" = queue.Queue()
         self.scan_thread: threading.Thread = threading.Thread(target=self._scan_worker, daemon=True)
         self.scan_thread.start()
         self.is_drawing: bool = False
         self.is_fullscreen: bool = False
-        self.animate_next_draw: bool = False
 
         self.search_var.trace_add("write", lambda *_: self.redraw())
         self._setup_keyboard_shortcuts()
@@ -190,6 +202,14 @@ class DiskVizApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
+
+        # Info strip
+        info_bar = tk.Frame(self.root, bg="#F6A21A", height=36)
+        info_bar.pack(fill=tk.X)
+        self.info_path_label = tk.Label(info_bar, text="Directory: —", bg="#F6A21A", fg="#241200", font=("Segoe UI", 11, "bold"))
+        self.info_path_label.pack(side=tk.LEFT, padx=12)
+        self.info_size_label = tk.Label(info_bar, text="", bg="#F6A21A", fg="#241200", font=("Segoe UI", 11))
+        self.info_size_label.pack(side=tk.RIGHT, padx=12)
 
         top_frame = ttk.Frame(self.root, padding=8)
         top_frame.pack(fill=tk.X)
@@ -231,29 +251,24 @@ class DiskVizApp:
         ttk.Button(btn_frame, text="Delete", command=self.delete_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="⛶", command=self.toggle_fullscreen, width=3).pack(side=tk.LEFT, padx=2)
 
-        legend = ttk.Frame(top_frame)
-        legend.grid(row=0, column=7, rowspan=2, sticky="ne")
-        ttk.Label(legend, text="Legend:", font=("TkDefaultFont", 9, "bold")).pack(anchor="e")
-        for label, color in FILE_TYPE_COLORS.items():
-            swatch = tk.Canvas(legend, width=14, height=14, highlightthickness=1, highlightbackground="#333")
-            swatch.create_rectangle(0, 0, 14, 14, fill=color, outline="")
-            frame = ttk.Frame(legend)
-            frame.pack(anchor="e")
-            swatch.pack(in_=frame, side=tk.LEFT, padx=(0, 4))
-            ttk.Label(frame, text=label.title()).pack(side=tk.LEFT)
-
         top_frame.columnconfigure(1, weight=1)
-        top_frame.columnconfigure(7, weight=0)
 
-        self.canvas = tk.Canvas(self.root, background=CANVAS_BG_COLOR)
+        self.canvas = tk.Canvas(self.root, background=CANVAS_BG_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda event: self.redraw())
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
         self.canvas.bind("<Motion>", self.on_canvas_motion)
-        self.canvas.bind("<Button-3>", self.on_canvas_right_click)
-        self.canvas.bind("<Control-Button-1>", self.on_canvas_right_click)
-        self.context_menu = tk.Menu(self.canvas, tearoff=0)
+        for sequence in (
+            "<Button-2>",
+            "<ButtonRelease-2>",
+            "<Button-3>",
+            "<ButtonRelease-3>",
+            "<Control-Button-1>",
+            "<Control-ButtonRelease-1>",
+        ):
+            self.canvas.bind(sequence, self.on_canvas_right_click, add="+")
+        self.context_menu = tk.Menu(self.root, tearoff=0)
 
         self.tooltip_var = tk.StringVar(value="")
         tooltip = ttk.Label(self.root, textvariable=self.tooltip_var, relief=tk.GROOVE, anchor="w")
@@ -263,6 +278,7 @@ class DiskVizApp:
         status = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w")
         status.pack(fill=tk.X, side=tk.BOTTOM)
         self.status_label = status
+        self._update_info_bar(None)
 
     def _setup_quick_access(self, parent: ttk.Frame) -> None:
         """Setup quick access menu for safe directories."""
@@ -382,6 +398,18 @@ select a different folder."""
             self.toggle_fullscreen()
         else:
             self._clear_selection()
+
+    def _update_info_bar(self, node: Optional[DiskNode] = None) -> None:
+        """Refresh the info strip with current path and size."""
+        if not hasattr(self, "info_path_label"):
+            return
+        target = node or self.current_node or self.root_node
+        if not target:
+            self.info_path_label.configure(text="Directory: —")
+            self.info_size_label.configure(text="")
+            return
+        self.info_path_label.configure(text=str(target.path))
+        self.info_size_label.configure(text=f"Total {format_size(target.size)}")
 
     def _clear_selection(self) -> None:
         """Clear the current selection."""
@@ -519,6 +547,7 @@ select a different folder."""
             status_parts.append(f"⚠ {len(stats.errors)} errors")
 
         self.status_var.set(" | ".join(status_parts))
+        self._update_info_bar(node)
 
         # Show permission warning if there are significant access issues
         if len(stats.permission_denied) >= 3:
@@ -526,7 +555,6 @@ select a different folder."""
 
         snapshot = tuple(sorted((str(path), size, mtime) for path, size, mtime in flatten_snapshot(node)))
         self.snapshot_hash = hash(snapshot)
-        self.animate_next_draw = True
         self.redraw()
         self._schedule_monitor()
 
@@ -547,6 +575,32 @@ select a different folder."""
         parent_display = self._truncate_label(parent_name or "/")
         return f"{name}\n[{parent_display}]\n{size_text}"
 
+    def _tile_colors(
+        self,
+        node: DiskNode,
+        depth: int,
+        search_match: bool,
+        query_active: bool,
+    ) -> tuple[str, str]:
+        base = DIR_TILE_BASE if node.is_dir else FILE_TILE_BASE
+        shade = min(max(depth - 1, 0), 3) * DEPTH_SHADE_FACTOR
+        fill_factor = max(0.05, NORMAL_LIGHTEN_FACTOR - shade)
+        fill = lighten(base, fill_factor)
+        outline = darken(base, max(0.1, 0.4 - shade * 0.5))
+
+        if query_active:
+            if search_match:
+                outline = SEARCH_MATCH_COLOR
+            else:
+                fill = lighten(fill, SEARCH_LIGHTEN_FACTOR)
+                outline = DIMMED_OUTLINE_COLOR
+
+        if node == self.selection:
+            outline = SELECTION_COLOR
+            fill = lighten(fill, 0.15)
+        return fill, outline
+
+
     def redraw(self) -> None:
         """Redraw the treemap visualization on the canvas."""
         if self.current_node is None or self.is_drawing:
@@ -556,8 +610,13 @@ select a different folder."""
             width = max(self.canvas.winfo_width(), 100)
             height = max(self.canvas.winfo_height(), 100)
             self.canvas.delete("all")
+            self.canvas.delete("all")
             self.canvas_rects.clear()
-            self.current_layout = slice_and_dice(self.current_node, Rect(0, 0, width, height), max_depth=1)
+            self.current_layout = slice_and_dice(
+                self.current_node,
+                Rect(0, 0, width, height),
+                max_depth=VISIBLE_DEPTH,
+            )
             query = self.search_var.get().lower().strip()
             matching_nodes = set()
             if query:
@@ -573,19 +632,19 @@ select a different folder."""
                 if rect.width <= 0 or rect.height <= 0:
                     continue
                 is_match = query and node in matching_nodes
-                if query and self.filter_var.get() and not is_match:
+                hide_non_match = self.filter_var.get()
+                if query and hide_non_match and not is_match:
                     continue
-                color = color_for_node(node.path, node.is_dir)
-                if query and not is_match:
-                    color = lighten(color, SEARCH_LIGHTEN_FACTOR)
-                    outline = DIMMED_OUTLINE_COLOR
-                else:
-                    outline = DEFAULT_OUTLINE_COLOR
-                if is_match:
-                    outline = SEARCH_MATCH_COLOR
-                if node == self.selection:
-                    outline = SELECTION_COLOR
-                item = self.canvas.create_rectangle(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, fill=color, outline=outline, width=1)
+                fill_color, outline = self._tile_colors(node, layout.depth, bool(is_match), bool(query))
+                item = self.canvas.create_rectangle(
+                    rect.x,
+                    rect.y,
+                    rect.x + rect.width,
+                    rect.y + rect.height,
+                    fill=fill_color,
+                    outline=outline,
+                    width=1.2,
+                )
                 self.canvas_rects[item] = node
                 drawn = True
                 if rect.width > MIN_LABEL_WIDTH and rect.height > MIN_LABEL_HEIGHT:
@@ -608,41 +667,25 @@ select a different folder."""
                     fill=TEXT_COLOR,
                     font=("Segoe UI", 12, "bold"),
                 )
+            elif not drawn:
+                self.canvas.create_text(
+                    width / 2,
+                    height / 2,
+                    text="This folder is empty.",
+                    fill="#a8b0c0",
+                    font=("Segoe UI", 12, "bold"),
+                )
         finally:
             self.is_drawing = False
-        if self.animate_next_draw:
-            self.animate_next_draw = False
-            self._play_transition_animation()
-
-    def _play_transition_animation(self) -> None:
-        """Create a subtle fade animation to smooth transitions."""
-        width = max(self.canvas.winfo_width(), 1)
-        height = max(self.canvas.winfo_height(), 1)
-        overlay_tag = "_transition_overlay"
-        overlay = self.canvas.create_rectangle(
-            0, 0, width, height, fill="#111111", outline="", stipple="gray50", tags=overlay_tag
-        )
-        steps = ["gray50", "gray25", "gray12", "gray8", ""]
-
-        def fade(step: int = 0) -> None:
-            if step >= len(steps):
-                self.canvas.delete(overlay)
-                return
-            stipple = steps[step]
-            if stipple:
-                try:
-                    self.canvas.itemconfig(overlay, stipple=stipple)
-                except tk.TclError:
-                    return
-                self.canvas.after(45, lambda: fade(step + 1))
-            else:
-                self.canvas.delete(overlay)
-
-        fade()
 
     # ------------------------------------------------------------------ mouse interaction
     def on_canvas_click(self, event: tk.Event) -> None:
         """Handle mouse click events on the canvas to select nodes."""
+        if event.state & 0x4:  # Control-click -> context menu
+            self.on_canvas_right_click(event)
+            return
+        if getattr(event, "num", 1) != 1:
+            return
         node = self._node_at(event.x, event.y)
         if not node:
             return
@@ -661,12 +704,16 @@ select a different folder."""
     def on_canvas_double_click(self, event: tk.Event) -> None:
         """Handle double-click to zoom into directories."""
         node = self._node_at(event.x, event.y)
-        if node and node.is_dir:
+        if not node:
+            return
+        if node.is_dir:
             self.current_node = node
             self.selection = None
             self.status_var.set(f"Viewing {node.path} — {format_size(node.size)}")
-            self.animate_next_draw = True
+            self._update_info_bar(node)
             self.redraw()
+        else:
+            self._open_file(node.path)
 
     def on_canvas_right_click(self, event: tk.Event) -> None:
         """Display a context menu for the clicked node."""
@@ -676,10 +723,7 @@ select a different folder."""
         self.selection = node
         self.tooltip_var.set(f"Selected: {node.path} ({format_size(node.size)})")
         # Avoid triggering animation for context menu redraws
-        animate_flag = self.animate_next_draw
-        self.animate_next_draw = False
         self.redraw()
-        self.animate_next_draw = animate_flag
         self._show_context_menu(event, node)
 
     def _node_at(self, x: int, y: int) -> Optional[DiskNode]:
@@ -703,8 +747,9 @@ select a different folder."""
         """Build and show the context menu for files/folders."""
         self.context_menu.delete(0, tk.END)
         if node.is_dir:
-            self.context_menu.add_command(label="Open in Finder", command=lambda n=node: self._open_in_finder(n.path))
+            self.context_menu.add_command(label="Open Folder", command=lambda n=node: self._open_path(n.path))
         else:
+            self.context_menu.add_command(label="Open File", command=lambda n=node: self._open_file(n.path))
             self.context_menu.add_command(label="Reveal in Finder", command=lambda n=node: self._reveal_in_finder(n.path))
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Delete…", command=self.delete_selected)
@@ -713,20 +758,41 @@ select a different folder."""
         finally:
             self.context_menu.grab_release()
 
-    def _open_in_finder(self, path: Path) -> None:
-        """Open the directory in Finder (macOS only)."""
+    def _open_path(self, path: Path) -> None:
+        """Open a path using the system default handler."""
         import platform
 
-        if platform.system() != "Darwin":
-            messagebox.showinfo("DiskViz", "Finder integration is only available on macOS.")
-            return
         if not path.exists():
             messagebox.showerror("DiskViz", f"Path does not exist: {path}")
             return
         try:
-            subprocess.run(["open", str(path)], check=False)
+            system = platform.system()
+            if system == "Darwin":
+                subprocess.run(["open", str(path)], check=False)
+            elif system == "Windows":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
         except Exception as exc:
-            messagebox.showerror("DiskViz", f"Failed to open in Finder: {exc}")
+            messagebox.showerror("DiskViz", f"Failed to open: {exc}")
+
+    def _open_file(self, path: Path) -> None:
+        """Open a file with the default application."""
+        import platform
+
+        if not path.exists():
+            messagebox.showerror("DiskViz", f"Path does not exist: {path}")
+            return
+        try:
+            system = platform.system()
+            if system == "Darwin":
+                subprocess.run(["open", str(path)], check=False)
+            elif system == "Windows":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
+        except Exception as exc:
+            messagebox.showerror("DiskViz", f"Failed to open file: {exc}")
 
     def _reveal_in_finder(self, path: Path) -> None:
         """Reveal the file in Finder (macOS only)."""
@@ -786,7 +852,7 @@ select a different folder."""
             if parent:
                 self.current_node = parent
                 self.status_var.set(f"Viewing {parent.path} — {format_size(parent.size)}")
-                self.animate_next_draw = True
+                self._update_info_bar(parent)
                 self.redraw()
             else:
                 # Fallback to root
@@ -798,7 +864,7 @@ select a different folder."""
             self.current_node = self.root_node
             self.selection = None
             self.status_var.set(f"Viewing {self.root_node.path} — {format_size(self.root_node.size)}")
-            self.animate_next_draw = True
+            self._update_info_bar(self.root_node)
             self.redraw()
 
     def _find_parent(self, root: DiskNode, target: DiskNode) -> Optional[DiskNode]:
