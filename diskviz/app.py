@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import shutil
+import subprocess
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -177,6 +178,7 @@ class DiskVizApp:
         self.scan_thread.start()
         self.is_drawing: bool = False
         self.is_fullscreen: bool = False
+        self.animate_next_draw: bool = False
 
         self.search_var.trace_add("write", lambda *_: self.redraw())
         self._setup_keyboard_shortcuts()
@@ -249,6 +251,9 @@ class DiskVizApp:
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
         self.canvas.bind("<Motion>", self.on_canvas_motion)
+        self.canvas.bind("<Button-3>", self.on_canvas_right_click)
+        self.canvas.bind("<Control-Button-1>", self.on_canvas_right_click)
+        self.context_menu = tk.Menu(self.canvas, tearoff=0)
 
         self.tooltip_var = tk.StringVar(value="")
         tooltip = ttk.Label(self.root, textvariable=self.tooltip_var, relief=tk.GROOVE, anchor="w")
@@ -521,6 +526,7 @@ select a different folder."""
 
         snapshot = tuple(sorted((str(path), size, mtime) for path, size, mtime in flatten_snapshot(node)))
         self.snapshot_hash = hash(snapshot)
+        self.animate_next_draw = True
         self.redraw()
         self._schedule_monitor()
 
@@ -551,7 +557,7 @@ select a different folder."""
             height = max(self.canvas.winfo_height(), 100)
             self.canvas.delete("all")
             self.canvas_rects.clear()
-            self.current_layout = slice_and_dice(self.current_node, Rect(0, 0, width, height))
+            self.current_layout = slice_and_dice(self.current_node, Rect(0, 0, width, height), max_depth=1)
             query = self.search_var.get().lower().strip()
             matching_nodes = set()
             if query:
@@ -560,6 +566,8 @@ select a different folder."""
 
             drawn = False
             for layout in self.current_layout:
+                if layout.depth == 0:
+                    continue
                 node = layout.node
                 rect = layout.rect.inset(RECT_INSET_PADDING)
                 if rect.width <= 0 or rect.height <= 0:
@@ -602,6 +610,35 @@ select a different folder."""
                 )
         finally:
             self.is_drawing = False
+        if self.animate_next_draw:
+            self.animate_next_draw = False
+            self._play_transition_animation()
+
+    def _play_transition_animation(self) -> None:
+        """Create a subtle fade animation to smooth transitions."""
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        overlay_tag = "_transition_overlay"
+        overlay = self.canvas.create_rectangle(
+            0, 0, width, height, fill="#111111", outline="", stipple="gray50", tags=overlay_tag
+        )
+        steps = ["gray50", "gray25", "gray12", "gray8", ""]
+
+        def fade(step: int = 0) -> None:
+            if step >= len(steps):
+                self.canvas.delete(overlay)
+                return
+            stipple = steps[step]
+            if stipple:
+                try:
+                    self.canvas.itemconfig(overlay, stipple=stipple)
+                except tk.TclError:
+                    return
+                self.canvas.after(45, lambda: fade(step + 1))
+            else:
+                self.canvas.delete(overlay)
+
+        fade()
 
     # ------------------------------------------------------------------ mouse interaction
     def on_canvas_click(self, event: tk.Event) -> None:
@@ -628,7 +665,22 @@ select a different folder."""
             self.current_node = node
             self.selection = None
             self.status_var.set(f"Viewing {node.path} — {format_size(node.size)}")
+            self.animate_next_draw = True
             self.redraw()
+
+    def on_canvas_right_click(self, event: tk.Event) -> None:
+        """Display a context menu for the clicked node."""
+        node = self._node_at(event.x, event.y)
+        if not node:
+            return
+        self.selection = node
+        self.tooltip_var.set(f"Selected: {node.path} ({format_size(node.size)})")
+        # Avoid triggering animation for context menu redraws
+        animate_flag = self.animate_next_draw
+        self.animate_next_draw = False
+        self.redraw()
+        self.animate_next_draw = animate_flag
+        self._show_context_menu(event, node)
 
     def _node_at(self, x: int, y: int) -> Optional[DiskNode]:
         """Find the DiskNode at the given canvas coordinates.
@@ -646,6 +698,50 @@ select a different folder."""
             if node:
                 return node
         return None
+
+    def _show_context_menu(self, event: tk.Event, node: DiskNode) -> None:
+        """Build and show the context menu for files/folders."""
+        self.context_menu.delete(0, tk.END)
+        if node.is_dir:
+            self.context_menu.add_command(label="Open in Finder", command=lambda n=node: self._open_in_finder(n.path))
+        else:
+            self.context_menu.add_command(label="Reveal in Finder", command=lambda n=node: self._reveal_in_finder(n.path))
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Delete…", command=self.delete_selected)
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def _open_in_finder(self, path: Path) -> None:
+        """Open the directory in Finder (macOS only)."""
+        import platform
+
+        if platform.system() != "Darwin":
+            messagebox.showinfo("DiskViz", "Finder integration is only available on macOS.")
+            return
+        if not path.exists():
+            messagebox.showerror("DiskViz", f"Path does not exist: {path}")
+            return
+        try:
+            subprocess.run(["open", str(path)], check=False)
+        except Exception as exc:
+            messagebox.showerror("DiskViz", f"Failed to open in Finder: {exc}")
+
+    def _reveal_in_finder(self, path: Path) -> None:
+        """Reveal the file in Finder (macOS only)."""
+        import platform
+
+        if platform.system() != "Darwin":
+            messagebox.showinfo("DiskViz", "Finder integration is only available on macOS.")
+            return
+        if not path.exists():
+            messagebox.showerror("DiskViz", f"Path does not exist: {path}")
+            return
+        try:
+            subprocess.run(["open", "-R", str(path)], check=False)
+        except Exception as exc:
+            messagebox.showerror("DiskViz", f"Failed to reveal file: {exc}")
 
     # ------------------------------------------------------------------ deletion
     def delete_selected(self) -> None:
@@ -690,6 +786,7 @@ select a different folder."""
             if parent:
                 self.current_node = parent
                 self.status_var.set(f"Viewing {parent.path} — {format_size(parent.size)}")
+                self.animate_next_draw = True
                 self.redraw()
             else:
                 # Fallback to root
@@ -701,6 +798,7 @@ select a different folder."""
             self.current_node = self.root_node
             self.selection = None
             self.status_var.set(f"Viewing {self.root_node.path} — {format_size(self.root_node.size)}")
+            self.animate_next_draw = True
             self.redraw()
 
     def _find_parent(self, root: DiskNode, target: DiskNode) -> Optional[DiskNode]:

@@ -57,7 +57,11 @@ class NodeRect:
 
 
 def slice_and_dice(
-    node: DiskNode, bounds: Rect, depth: int = 0, parent: Optional[DiskNode] = None
+    node: DiskNode,
+    bounds: Rect,
+    depth: int = 0,
+    parent: Optional[DiskNode] = None,
+    max_depth: Optional[int] = None,
 ) -> List[NodeRect]:
     """Compute a treemap layout using the slice-and-dice algorithm.
 
@@ -70,12 +74,13 @@ def slice_and_dice(
         bounds: Available rectangle bounds
         depth: Current tree depth (controls slice direction)
         parent: Parent node, if any
+        max_depth: Maximum depth to recurse (None for entire tree)
 
     Returns:
         List of NodeRect entries for the entire tree
     """
     layouts: List[NodeRect] = [NodeRect(node=node, rect=bounds, depth=depth, parent=parent)]
-    if not node.children or node.size <= 0:
+    if not node.children or node.size <= 0 or (max_depth is not None and depth >= max_depth):
         return layouts
 
     horizontal = depth % 2 == 0
@@ -99,7 +104,7 @@ def slice_and_dice(
                 bounds.height * ratio,
             )
             offset += child_rect.height
-        layouts.extend(slice_and_dice(child, child_rect, depth + 1, node))
+        layouts.extend(slice_and_dice(child, child_rect, depth + 1, node, max_depth))
     return layouts
 
 
