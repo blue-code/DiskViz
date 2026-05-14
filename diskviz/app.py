@@ -8,6 +8,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -443,21 +444,28 @@ select a different folder."""
         self.root.bind("<Control-Key-0>", lambda e: self.tag_selected(None))
 
     def _on_first_appear(self) -> None:
-        """Pull the window to the front and ask for a folder if none is set."""
+        """Activate the app and prompt for a folder if none is set."""
+        _log("_on_first_appear: enter")
         try:
             self.root.update_idletasks()
             self.root.deiconify()
             self.root.lift()
-            self.root.attributes("-topmost", True)
-            self.root.after(200, lambda: self.root.attributes("-topmost", False))
-            self.root.focus_force()
+            # Make sure topmost is OFF before the picker opens; otherwise
+            # the file dialog appears behind the main window on macOS.
+            self.root.attributes("-topmost", False)
         except tk.TclError:
             pass
 
-        if not self.path_var.get().strip() and not self.current_node:
-            # Defer the dialog one tick so the main window has a chance to
-            # paint before the modal picker steals focus.
-            self.root.after(50, self.choose_directory)
+        empty_path = not self.path_var.get().strip()
+        no_current = not self.current_node
+        _log(f"_on_first_appear: empty_path={empty_path} no_current={no_current}")
+        if empty_path and no_current:
+            # Defer one tick so the main window has a chance to paint
+            # before the modal picker steals focus. The picker is modal,
+            # so it will naturally come to the foreground without us
+            # forcing process-level activation (which can prematurely
+            # dismiss the dialog).
+            self.root.after(200, self.choose_directory)
 
     def toggle_fullscreen(self) -> None:
         """Toggle fullscreen mode."""
@@ -561,6 +569,7 @@ select a different folder."""
     # ------------------------------------------------------------------ directory selection
     def choose_directory(self) -> None:
         """Open a file dialog to select a directory to visualize."""
+        _log("choose_directory: enter")
         import platform
 
         # Set initial directory to a safe location
@@ -571,10 +580,19 @@ select a different folder."""
             if safe_dirs:
                 initial_dir = str(safe_dirs[0][1])
 
+        # Make sure the main window isn't pinned on top so the file picker
+        # (NSOpenPanel) can render above it.
+        try:
+            self.root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+        _log("choose_directory: about to askdirectory")
         path = filedialog.askdirectory(
             title="Select directory to visualize",
-            initialdir=initial_dir
+            initialdir=initial_dir,
         )
+        _log(f"choose_directory: askdirectory returned {path!r}")
         if path:
             self.path_var.set(path)
             self.schedule_scan()
