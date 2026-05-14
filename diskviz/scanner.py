@@ -49,7 +49,10 @@ def _safe_stat(path: Path) -> Tuple[int, int]:
 
 
 def scan_directory(
-    root: Path, max_depth: int = 4, follow_symlinks: bool = False
+    root: Path,
+    max_depth: int = 4,
+    follow_symlinks: bool = False,
+    show_hidden: bool = False,
 ) -> Tuple[DiskNode, ScanStats]:
     """Build a DiskNode tree representing disk usage starting at root.
 
@@ -57,18 +60,24 @@ def scan_directory(
         root: Root directory to scan
         max_depth: Maximum depth to recurse into subdirectories
         follow_symlinks: Whether to follow symbolic links
+        show_hidden: Whether to include dotfiles / hidden entries
 
     Returns:
         Tuple of (DiskNode tree, ScanStats with collection statistics)
     """
     root = root.expanduser().resolve()
     stats = ScanStats()
-    node = _scan_node(root, 0, max_depth, follow_symlinks, stats)
+    node = _scan_node(root, 0, max_depth, follow_symlinks, show_hidden, stats)
     return node, stats
 
 
 def _scan_node(
-    path: Path, depth: int, max_depth: int, follow_symlinks: bool, stats: ScanStats
+    path: Path,
+    depth: int,
+    max_depth: int,
+    follow_symlinks: bool,
+    show_hidden: bool,
+    stats: ScanStats,
 ) -> DiskNode:
     """Recursively scan a single filesystem node.
 
@@ -106,8 +115,12 @@ def _scan_node(
             for entry in entries:
                 if entry.name in IGNORED_NAMES:
                     continue
+                if not show_hidden and entry.name.startswith("."):
+                    continue
                 child_path = Path(entry.path)
-                child_node = _scan_node(child_path, depth + 1, max_depth, follow_symlinks, stats)
+                child_node = _scan_node(
+                    child_path, depth + 1, max_depth, follow_symlinks, show_hidden, stats
+                )
                 size += child_node.size
                 mtime = max(mtime, child_node.modified_ns)
                 children.append(child_node)
@@ -126,6 +139,49 @@ def _scan_node(
     size, mtime = _safe_stat(path)
     stats.files_scanned += 1
     return DiskNode(path, size, False, mtime, [])
+
+
+def scan_many(
+    paths: Iterable[Path],
+    max_depth: int = 4,
+    follow_symlinks: bool = False,
+    show_hidden: bool = False,
+) -> Tuple[DiskNode, ScanStats]:
+    """Scan multiple roots and merge them under a synthetic ``Volumes`` node.
+
+    Returns a single root node so the existing treemap/UI works unchanged.
+    If only one path is supplied, that scan is returned directly.
+    """
+    paths = [Path(p) for p in paths]
+    stats = ScanStats()
+    if not paths:
+        empty = DiskNode(Path("∅"), 0, True, int(time.time_ns()), [])
+        return empty, stats
+    if len(paths) == 1:
+        return scan_directory(paths[0], max_depth, follow_symlinks, show_hidden)
+
+    children: List[DiskNode] = []
+    total_size = 0
+    max_mtime = 0
+    for path in paths:
+        child, child_stats = scan_directory(path, max_depth, follow_symlinks, show_hidden)
+        children.append(child)
+        total_size += child.size
+        max_mtime = max(max_mtime, child.modified_ns)
+        stats.files_scanned += child_stats.files_scanned
+        stats.dirs_scanned += child_stats.dirs_scanned
+        stats.permission_denied.extend(child_stats.permission_denied)
+        stats.errors.extend(child_stats.errors)
+
+    children.sort(key=lambda node: node.size, reverse=True)
+    synthetic = DiskNode(
+        Path("Volumes"),
+        total_size,
+        True,
+        max_mtime or int(time.time_ns()),
+        children,
+    )
+    return synthetic, stats
 
 
 def flatten_snapshot(node: DiskNode) -> Iterable[Tuple[Path, int, int]]:

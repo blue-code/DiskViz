@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import csv
 import math
 import os
 import queue
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional
 
+from .filters import FilterError, TAG_NAMES, build_predicate
 from .model import DiskNode
-from .scanner import ScanStats, flatten_snapshot, scan_directory
+from .scanner import ScanStats, flatten_snapshot, scan_many
 from .treemap import NodeRect, Rect, filter_layout, slice_and_dice
 
 # UI Constants
@@ -27,20 +30,41 @@ MAX_SCAN_QUEUE_SIZE = 2
 # Canvas & palette constants (SpaceSniffer style)
 CANVAS_BG_COLOR = "#0E1018"
 RECT_INSET_PADDING = 1.0
-MIN_LABEL_WIDTH = 80
-MIN_LABEL_HEIGHT = 38
+MIN_LABEL_WIDTH = 40  # 더 작은 블록에도 레이블 표시
+MIN_LABEL_HEIGHT = 20  # 더 작은 블록에도 레이블 표시
+MIN_SMALL_LABEL_WIDTH = 25  # 매우 작은 블록용
+MIN_SMALL_LABEL_HEIGHT = 15  # 매우 작은 블록용
 
-DIR_TILE_BASE = "#C48B4A"
-FILE_TILE_BASE = "#4D90D5"
+DIR_TILE_BASE = "#D69941"  # 더 선명한 골드/오렌지 (디렉토리)
+FILE_TILE_BASE = "#4A8FDB"  # 더 밝고 선명한 블루 (파일)
 SELECTION_COLOR = "#FFE066"
 SEARCH_MATCH_COLOR = "#47E2C1"
 DIMMED_OUTLINE_COLOR = "#2F3442"
-TEXT_COLOR = "#191919"
+TEXT_COLOR = "#1A1A1A"  # 약간 더 진한 텍스트로 가독성 향상
 
-NORMAL_LIGHTEN_FACTOR = 0.25
+NORMAL_LIGHTEN_FACTOR = 0.30  # 더 밝고 선명한 색상
 SEARCH_LIGHTEN_FACTOR = 0.45
-DEPTH_SHADE_FACTOR = 0.06
-VISIBLE_DEPTH: Optional[int] = None  # Show entire hierarchy for richer treemap
+DEPTH_SHADE_FACTOR = 0.08  # 깊이에 따른 색상 대비 강화
+# SpaceSniffer-style nested rendering: render the whole hierarchy at once
+# (children inside parents) and let MIN_NEST_DIMENSION_PX in treemap.py stop
+# the recursion when the inner space is too small.
+VISIBLE_DEPTH: Optional[int] = None
+HEADER_LABEL_HEIGHT = 14  # must match treemap.HEADER_HEIGHT_PX
+
+# Tiles smaller than this on either side are skipped — too small to perceive
+# or click reliably, and they only clutter the canvas. SpaceSniffer behaves
+# similarly: very thin items collapse into the parent rectangle.
+MIN_VISIBLE_TILE_PX = 2
+
+# 4-color tag palette (Ctrl+1~4) – matches SpaceSniffer convention
+TAG_COLORS = {
+    "red": "#E03B3B",
+    "yellow": "#F2C94C",
+    "green": "#27AE60",
+    "blue": "#2F80ED",
+}
+TAG_CORNER_SIZE = 14
+FILTER_HINT = "e.g. *.jpg;>1mb;<3months  |  :red  |  |*.log"
 
 
 def check_directory_access(path: Path) -> tuple[bool, str]:
@@ -108,9 +132,33 @@ def get_safe_directories() -> List[tuple[str, Path]]:
 
 @dataclass
 class _PendingScan:
-    path: Path
+    paths: List[Path]
     depth: int
     follow_symlinks: bool
+    show_hidden: bool = False
+
+
+_LOG_PATH = Path("~/Library/Logs/DiskViz.log").expanduser()
+
+
+def _log(message: str) -> None:
+    """Append a diagnostic line to ~/Library/Logs/DiskViz.log."""
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _format_mtime(modified_ns: int) -> str:
+    """Format a ns-resolution timestamp as a local ISO-8601 string."""
+    if modified_ns <= 0:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(modified_ns / 1_000_000_000))
+    except (OSError, ValueError):
+        return ""
 
 
 def format_size(num_bytes: int) -> str:
@@ -174,6 +222,7 @@ class DiskVizApp:
         self.search_var = tk.StringVar()
         self.depth_var = tk.IntVar(value=DEFAULT_SCAN_DEPTH)
         self.follow_symlinks = tk.BooleanVar(value=False)
+        self.show_hidden = tk.BooleanVar(value=False)
         self.filter_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="💡 Select a folder below or use Quick Access buttons for safe directories")
 
@@ -181,8 +230,14 @@ class DiskVizApp:
         self.root_node: Optional[DiskNode] = None  # Store original root for navigation
         self.current_layout: List[NodeRect] = []
         self.canvas_rects: Dict[int, DiskNode] = {}
+        self.rect_geom: Dict[int, Rect] = {}
         self.selection: Optional[DiskNode] = None
         self.snapshot_hash: Optional[int] = None
+
+        # Multi-volume + tagging
+        self.extra_paths: List[Path] = []
+        self.tags: Dict[str, str] = {}
+        self.last_stats: Optional[ScanStats] = None
 
         self._setup_ui()
         self.monitor_job: Optional[str] = None
@@ -191,9 +246,17 @@ class DiskVizApp:
         self.scan_thread.start()
         self.is_drawing: bool = False
         self.is_fullscreen: bool = False
+        self.is_scanning: bool = False
+        self._scan_anim_job: Optional[str] = None
+        self._scan_anim_step: int = 0
+        self._scan_label_text: str = ""
 
         self.search_var.trace_add("write", lambda *_: self.redraw())
         self._setup_keyboard_shortcuts()
+
+        # Bring the window to the foreground on launch (py2app/Tk on macOS
+        # otherwise leaves it behind other apps) and prompt for a folder.
+        self.root.after(100, self._on_first_appear)
 
     # ------------------------------------------------------------------ UI
     def _setup_ui(self) -> None:
@@ -219,6 +282,7 @@ class DiskVizApp:
         entry = ttk.Entry(top_frame, textvariable=self.path_var, width=50)
         entry.grid(row=0, column=1, sticky="we", padx=(4, 4))
         ttk.Button(top_frame, text="Browse", command=self.choose_directory).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(top_frame, text="+ Add Path", command=self.add_directory).grid(row=0, column=7, padx=(0, 4))
 
         # Quick Access dropdown
         self._setup_quick_access(top_frame)
@@ -232,9 +296,19 @@ class DiskVizApp:
         follow_box = ttk.Checkbutton(top_frame, text="Follow symlinks", variable=self.follow_symlinks, command=self.schedule_scan)
         follow_box.grid(row=0, column=6, padx=(0, 8))
 
-        ttk.Label(top_frame, text="Search:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        hidden_box = ttk.Checkbutton(
+            top_frame, text="Show hidden", variable=self.show_hidden, command=self.schedule_scan
+        )
+        hidden_box.grid(row=0, column=8, padx=(0, 8))
+
+        ttk.Label(top_frame, text="Filter:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         search_entry = ttk.Entry(top_frame, textvariable=self.search_var)
         search_entry.grid(row=1, column=1, sticky="we", padx=(4, 4), pady=(6, 0))
+        # Tooltip-style help hint sits right under the entry as a label.
+        self.filter_hint_var = tk.StringVar(value=FILTER_HINT)
+        ttk.Label(
+            top_frame, textvariable=self.filter_hint_var, foreground="#888888"
+        ).grid(row=2, column=1, sticky="w", padx=(4, 4))
         ttk.Checkbutton(
             top_frame,
             text="Hide non-matching",
@@ -244,11 +318,13 @@ class DiskVizApp:
 
         # Navigation and action buttons
         btn_frame = ttk.Frame(top_frame)
-        btn_frame.grid(row=1, column=3, columnspan=3, pady=(6, 0), sticky="w")
+        btn_frame.grid(row=1, column=3, columnspan=6, pady=(6, 0), sticky="w")
         ttk.Button(btn_frame, text="Up ↑", command=self.go_up, width=8).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Button(btn_frame, text="Reset", command=self.reset_view, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Rescan", command=self.schedule_scan, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Delete", command=self.delete_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Rename", command=self.rename_selected, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Export…", command=self.export_report, width=9).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="⛶", command=self.toggle_fullscreen, width=3).pack(side=tk.LEFT, padx=2)
 
         top_frame.columnconfigure(1, weight=1)
@@ -357,6 +433,31 @@ select a different folder."""
         self.root.bind("<Escape>", lambda e: self._handle_escape())
         # Ctrl+Q - Quit
         self.root.bind("<Control-q>", lambda e: self.root.quit())
+        # F2 - Rename
+        self.root.bind("<F2>", lambda e: self.rename_selected())
+        # Ctrl+1..4 - Tag selection with a color, Ctrl+0 - clear
+        self.root.bind("<Control-Key-1>", lambda e: self.tag_selected("red"))
+        self.root.bind("<Control-Key-2>", lambda e: self.tag_selected("yellow"))
+        self.root.bind("<Control-Key-3>", lambda e: self.tag_selected("green"))
+        self.root.bind("<Control-Key-4>", lambda e: self.tag_selected("blue"))
+        self.root.bind("<Control-Key-0>", lambda e: self.tag_selected(None))
+
+    def _on_first_appear(self) -> None:
+        """Pull the window to the front and ask for a folder if none is set."""
+        try:
+            self.root.update_idletasks()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+        if not self.path_var.get().strip() and not self.current_node:
+            # Defer the dialog one tick so the main window has a chance to
+            # paint before the modal picker steals focus.
+            self.root.after(50, self.choose_directory)
 
     def toggle_fullscreen(self) -> None:
         """Toggle fullscreen mode."""
@@ -478,43 +579,78 @@ select a different folder."""
             self.path_var.set(path)
             self.schedule_scan()
 
+    def add_directory(self) -> None:
+        """Pick an additional path to merge into the current treemap view."""
+        extra = filedialog.askdirectory(title="Add another directory to compare")
+        if not extra:
+            return
+        extra_path = Path(extra).expanduser()
+        if not self.path_var.get().strip():
+            # Treat this as the primary path if nothing was scanned yet.
+            self.path_var.set(str(extra_path))
+            self.schedule_scan()
+            return
+        if extra_path in self.extra_paths or str(extra_path) == self.path_var.get().strip():
+            self.status_var.set(f"Path already included: {extra_path}")
+            return
+        self.extra_paths.append(extra_path)
+        self.schedule_scan()
+
+    def _collect_scan_paths(self) -> List[Path]:
+        primary = self.path_var.get().strip()
+        paths: List[Path] = []
+        if primary:
+            paths.append(Path(primary).expanduser())
+        for extra in self.extra_paths:
+            if extra not in paths:
+                paths.append(extra)
+        return paths
+
     def schedule_scan(self) -> None:
         """Schedule a directory scan with current settings."""
-        path_value = self.path_var.get().strip()
-        if not path_value:
-            return
-        path = Path(path_value).expanduser()
-
-        if not path.exists():
-            self.status_var.set(f"❌ Path does not exist: {path}")
-            messagebox.showerror("Invalid Path", f"The path does not exist:\n{path}")
+        paths = self._collect_scan_paths()
+        if not paths:
             return
 
-        # Check directory access before scanning
-        accessible, message = check_directory_access(path)
-        if not accessible:
-            self.status_var.set(f"❌ {message}: {path}")
+        for path in paths:
+            if not path.exists():
+                self.status_var.set(f"❌ Path does not exist: {path}")
+                messagebox.showerror("Invalid Path", f"The path does not exist:\n{path}")
+                return
 
-            # Show helpful error dialog
-            import platform
-            error_msg = f"Cannot access directory:\n{path}\n\n{message}"
-
-            if platform.system() == "Darwin" and "Permission denied" in message:
-                error_msg += "\n\n💡 Tip: Use the 'Quick Access' menu to select\naccessible directories, or grant Full Disk Access\nin System Settings → Privacy & Security."
-
-            result = messagebox.askyesno(
-                "Access Denied",
-                error_msg + "\n\nWould you like to see permission help?",
-                icon="error"
-            )
-            if result:
-                self._show_permission_help()
-            return
+            accessible, message = check_directory_access(path)
+            if not accessible:
+                self.status_var.set(f"❌ {message}: {path}")
+                import platform
+                error_msg = f"Cannot access directory:\n{path}\n\n{message}"
+                if platform.system() == "Darwin" and "Permission denied" in message:
+                    error_msg += "\n\n💡 Tip: Use the 'Quick Access' menu to select\naccessible directories, or grant Full Disk Access\nin System Settings → Privacy & Security."
+                result = messagebox.askyesno(
+                    "Access Denied",
+                    error_msg + "\n\nWould you like to see permission help?",
+                    icon="error",
+                )
+                if result:
+                    self._show_permission_help()
+                return
 
         self._clear_pending_scans()
-        pending = _PendingScan(path=path, depth=int(self.depth_var.get()), follow_symlinks=self.follow_symlinks.get())
+        pending = _PendingScan(
+            paths=paths,
+            depth=int(self.depth_var.get()),
+            follow_symlinks=self.follow_symlinks.get(),
+            show_hidden=self.show_hidden.get(),
+        )
         self.scan_queue.put(pending)
-        self.status_var.set(f"🔍 Scanning {path} ...")
+        if len(paths) == 1:
+            label = str(paths[0])
+            self.status_var.set(f"🔍 Scanning {label} ...")
+        else:
+            label = f"{len(paths)} paths"
+            self.status_var.set(f"🔍 Scanning {label} ...")
+        self._scan_label_text = label
+        self.is_scanning = True
+        self._show_scan_overlay()
 
     def _scan_worker(self) -> None:
         """Background thread worker that processes scan requests."""
@@ -523,17 +659,105 @@ select a different folder."""
             if pending is None:
                 break
             try:
-                node, stats = scan_directory(pending.path, max_depth=pending.depth, follow_symlinks=pending.follow_symlinks)
+                node, stats = scan_many(
+                    pending.paths,
+                    max_depth=pending.depth,
+                    follow_symlinks=pending.follow_symlinks,
+                    show_hidden=pending.show_hidden,
+                )
             except Exception as exc:  # pragma: no cover - defensive
-                self.root.after(0, lambda e=exc: self.status_var.set(f"Scan failed: {e}"))
+                self.root.after(0, lambda e=exc: self._on_scan_failure(e))
                 continue
             self.root.after(0, lambda n=node, p=pending, s=stats: self._apply_scan(n, p, s))
 
+    def _on_scan_failure(self, exc: BaseException) -> None:
+        self.is_scanning = False
+        self._stop_scan_overlay()
+        self.status_var.set(f"Scan failed: {exc}")
+
+    def _show_scan_overlay(self) -> None:
+        """Display a centered animated 'Scanning…' indicator on the canvas."""
+        # Cancel any prior animation before starting a new one.
+        if self._scan_anim_job is not None:
+            try:
+                self.root.after_cancel(self._scan_anim_job)
+            except tk.TclError:
+                pass
+            self._scan_anim_job = None
+        self._scan_anim_step = 0
+        self._tick_scan_overlay()
+
+    def _tick_scan_overlay(self) -> None:
+        if not self.is_scanning:
+            return
+        try:
+            width = max(self.canvas.winfo_width(), 100)
+            height = max(self.canvas.winfo_height(), 100)
+            self.canvas.delete("scan_overlay")
+            dots = "." * (self._scan_anim_step % 4)
+            self.canvas.create_text(
+                width / 2,
+                height / 2 - 14,
+                text=f"🔍  Scanning {self._scan_label_text}{dots}",
+                fill="#e0e6f5",
+                font=("Segoe UI", 16, "bold"),
+                tags="scan_overlay",
+            )
+            self.canvas.create_text(
+                width / 2,
+                height / 2 + 16,
+                text="Large drives can take a minute. Permission prompts may appear.",
+                fill="#7d8499",
+                font=("Segoe UI", 11),
+                tags="scan_overlay",
+            )
+        except tk.TclError:
+            return
+        self._scan_anim_step += 1
+        self._scan_anim_job = self.root.after(400, self._tick_scan_overlay)
+
+    def _stop_scan_overlay(self) -> None:
+        if self._scan_anim_job is not None:
+            try:
+                self.root.after_cancel(self._scan_anim_job)
+            except tk.TclError:
+                pass
+            self._scan_anim_job = None
+        try:
+            self.canvas.delete("scan_overlay")
+        except tk.TclError:
+            pass
+
     def _apply_scan(self, node: DiskNode, pending: _PendingScan, stats: ScanStats) -> None:
         """Apply scan results to the UI and update the display."""
-        self.current_node = node
+        self.is_scanning = False
+        self._stop_scan_overlay()
+
+        # Preserve the user's drill-down view across periodic rescans. We
+        # remember the path of the previously-viewed folder, then resolve it
+        # against the freshly-built tree. Without this, the monitor's 5s
+        # rescan would always reset current_node to the scan root and the
+        # user would lose their zoom every cycle.
+        prior_view_path: Optional[Path] = None
+        if (
+            self.current_node is not None
+            and self.root_node is not None
+            and self.current_node is not self.root_node
+        ):
+            prior_view_path = self.current_node.path
+
         self.root_node = node  # Store the scan root
+        if prior_view_path is not None:
+            match = node.find_by_path(prior_view_path)
+            self.current_node = match if match is not None else node
+        else:
+            self.current_node = node
         self.selection = None
+        self.last_stats = stats
+        _log(
+            f"_apply_scan: root={node.path} size={node.size} children={len(node.children)} "
+            f"files={stats.files_scanned} dirs={stats.dirs_scanned} denied={len(stats.permission_denied)}"
+        )
 
         # Build status message
         status_parts = [
@@ -563,17 +787,94 @@ select a different folder."""
         """Truncate long labels so they fit better inside rectangles."""
         return text if len(text) <= max_length else text[: max_length - 1] + "…"
 
-    def _format_node_label(self, node: DiskNode) -> str:
-        """Build the multi-line label displayed inside each rectangle."""
+    def _format_node_label(self, node: DiskNode, width: float, height: float) -> str:
+        """Build the multi-line label displayed inside each rectangle.
+
+        Args:
+            node: Node to create label for
+            width: Rectangle width
+            height: Rectangle height
+
+        Returns:
+            Formatted label string (simplified for smaller rectangles)
+        """
         name = self._truncate_label(node.name or str(node.path))
         size_text = format_size(node.size)
+
+        # 매우 작은 블록: 이름만
+        if width < 50 or height < 25:
+            max_chars = int(width / 6)  # 대략 문자당 6px
+            return name[:max_chars] if max_chars > 0 else ""
+
+        # 작은 블록: 이름 + 크기
+        if width < MIN_LABEL_WIDTH or height < MIN_LABEL_HEIGHT:
+            if node.is_dir:
+                return f"{name}/\n{size_text}"
+            return f"{name}\n{size_text}"
+
+        # 일반 블록: 전체 정보 + 항목 개수 (디렉토리의 경우)
         if node.is_dir:
             display_name = f"{name or '/'}"
+            # 디렉토리는 파일/폴더 개수 표시
+            item_count = len(node.children)
+            if item_count > 0:
+                files = sum(1 for c in node.children if not c.is_dir)
+                dirs = item_count - files
+                if dirs > 0 and files > 0:
+                    count_text = f"({dirs} dirs, {files} files)"
+                elif dirs > 0:
+                    count_text = f"({dirs} dirs)"
+                else:
+                    count_text = f"({files} files)"
+                return f"{display_name}/\n{count_text}\n{size_text}"
             return f"{display_name}/\n{size_text}"
         parent = node.path.parent
         parent_name = parent.name or str(parent)
         parent_display = self._truncate_label(parent_name or "/")
         return f"{name}\n[{parent_display}]\n{size_text}"
+
+    def _format_header_label(self, node: DiskNode, width: float) -> str:
+        """SpaceSniffer-style 'name - size' header, truncated to fit."""
+        size_text = format_size(node.size)
+        suffix = "/" if node.is_dir else ""
+        # Roughly 7px/char @ 10pt; budget for the size suffix and dash.
+        max_chars = max(4, int(width / 6) - len(size_text) - 4)
+        name = node.name or str(node.path)
+        if len(name) > max_chars:
+            name = name[: max(1, max_chars - 1)] + "…"
+        return f"{name}{suffix} – {size_text}"
+
+    def _header_font_size(self, width: float, height: float) -> int:
+        if height < 18:
+            return 8
+        if width < 80:
+            return 8
+        if width < 160:
+            return 9
+        return 10
+
+    def _get_adaptive_font_size(self, width: float, height: float) -> int:
+        """Calculate font size based on rectangle dimensions.
+
+        Args:
+            width: Rectangle width
+            height: Rectangle height
+
+        Returns:
+            Font size (6-10)
+        """
+        # 블록이 클수록 큰 폰트 사용
+        area = width * height
+        if area > 10000:  # 큰 블록
+            return 10
+        elif area > 4000:  # 중간 블록
+            return 9
+        elif area > 1500:  # 작은 블록
+            return 8
+        elif area > 600:  # 매우 작은 블록
+            return 7
+        else:  # 극소 블록
+            return 6
 
     def _tile_colors(
         self,
@@ -586,7 +887,8 @@ select a different folder."""
         shade = min(max(depth - 1, 0), 3) * DEPTH_SHADE_FACTOR
         fill_factor = max(0.05, NORMAL_LIGHTEN_FACTOR - shade)
         fill = lighten(base, fill_factor)
-        outline = darken(base, max(0.1, 0.4 - shade * 0.5))
+        # 더 미세한 경계선 - SpaceSniffer 스타일
+        outline = darken(base, max(0.08, 0.25 - shade * 0.3))
 
         if query_active:
             if search_match:
@@ -601,73 +903,139 @@ select a different folder."""
         return fill, outline
 
 
+    def _compile_filter(self):
+        """Build a predicate from the filter entry. Returns (predicate, raw, error)."""
+        raw = self.search_var.get().strip()
+        if not raw:
+            return None, "", None
+        try:
+            predicate = build_predicate(raw, self.tags)
+        except FilterError as exc:
+            return None, raw, str(exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, raw, str(exc)
+        return predicate, raw, None
+
     def redraw(self) -> None:
         """Redraw the treemap visualization on the canvas."""
         if self.current_node is None or self.is_drawing:
+            return
+        if self.is_scanning:
+            # Keep the scan overlay visible — re-tick it after a resize.
+            self._tick_scan_overlay()
             return
         self.is_drawing = True
         try:
             width = max(self.canvas.winfo_width(), 100)
             height = max(self.canvas.winfo_height(), 100)
-            self.canvas.delete("all")
+            _log(
+                f"redraw: canvas={width}x{height} root={self.current_node.path} "
+                f"size={self.current_node.size} children={len(self.current_node.children)}"
+            )
             self.canvas.delete("all")
             self.canvas_rects.clear()
+            self.rect_geom.clear()
             self.current_layout = slice_and_dice(
                 self.current_node,
                 Rect(0, 0, width, height),
                 max_depth=VISIBLE_DEPTH,
             )
-            query = self.search_var.get().lower().strip()
-            matching_nodes = set()
-            if query:
-                filtered_layouts = list(filter_layout(self.current_layout, query))
+            _log(f"redraw: layout entries={len(self.current_layout)}")
+
+            predicate, raw_filter, filter_error = self._compile_filter()
+            if filter_error:
+                self.filter_hint_var.set(f"⚠ {filter_error}")
+                query_active = False
+                matching_nodes: set = set()
+            elif predicate is None:
+                self.filter_hint_var.set(FILTER_HINT)
+                query_active = False
+                matching_nodes = set()
+            else:
+                self.filter_hint_var.set(FILTER_HINT)
+                query_active = True
+                filtered_layouts = list(filter_layout(self.current_layout, raw_filter, predicate))
                 matching_nodes = {layout.node for layout in filtered_layouts}
 
-            drawn = False
+            drawn_children = 0
+            drawn_root = False
             for layout in self.current_layout:
-                if layout.depth == 0:
-                    continue
                 node = layout.node
                 rect = layout.rect.inset(RECT_INSET_PADDING)
                 if rect.width <= 0 or rect.height <= 0:
                     continue
-                is_match = query and node in matching_nodes
-                hide_non_match = self.filter_var.get()
-                if query and hide_non_match and not is_match:
+                # Don't draw sub-pixel children — they would only paint a
+                # single line over the parent rect, which is more confusing
+                # than informative. The parent stays clickable.
+                if layout.depth > 0 and (
+                    rect.width < MIN_VISIBLE_TILE_PX
+                    or rect.height < MIN_VISIBLE_TILE_PX
+                ):
                     continue
-                fill_color, outline = self._tile_colors(node, layout.depth, bool(is_match), bool(query))
+                is_match = query_active and node in matching_nodes
+                hide_non_match = self.filter_var.get()
+                if query_active and hide_non_match and not is_match:
+                    continue
+                fill_color, outline = self._tile_colors(node, layout.depth, bool(is_match), bool(query_active))
+                is_selected = node is self.selection
+                # Integer coords for crisp rendering on the bundled Tk build.
+                x1 = int(round(rect.x))
+                y1 = int(round(rect.y))
+                x2 = int(round(rect.x + rect.width))
+                y2 = int(round(rect.y + rect.height))
+                # A thicker bright border on the selected tile mimics
+                # SpaceSniffer's selection frame so the user can see exactly
+                # which deeply-nested item they're on.
+                border_width = 3 if is_selected else 1
+                border_color = SELECTION_COLOR if is_selected else outline
                 item = self.canvas.create_rectangle(
-                    rect.x,
-                    rect.y,
-                    rect.x + rect.width,
-                    rect.y + rect.height,
+                    x1, y1, x2, y2,
                     fill=fill_color,
-                    outline=outline,
-                    width=1.2,
+                    outline=border_color,
+                    width=border_width,
                 )
                 self.canvas_rects[item] = node
-                drawn = True
-                if rect.width > MIN_LABEL_WIDTH and rect.height > MIN_LABEL_HEIGHT:
-                    label = self._format_node_label(node)
-                    # Use bold font for directories
-                    font_spec = ("Segoe UI", 9, "bold") if node.is_dir else ("Segoe UI", 9)
+                self.rect_geom[item] = rect
+                if layout.depth == 0:
+                    drawn_root = True
+                else:
+                    drawn_children += 1
+
+                # SpaceSniffer-style label: "name - size" at the TOP-LEFT of
+                # the rect, inside the header strip we reserved. This way each
+                # parent's title sits above its nested children.
+                if layout.depth > 0 and rect.width >= 36 and rect.height >= 16:
+                    label = self._format_header_label(node, rect.width)
+                    font_size = self._header_font_size(rect.width, rect.height)
+                    font_spec = (
+                        ("Segoe UI", font_size, "bold")
+                        if node.is_dir
+                        else ("Segoe UI", font_size)
+                    )
                     self.canvas.create_text(
-                        rect.x + rect.width / 2,
-                        rect.y + rect.height / 2,
+                        x1 + 4,
+                        y1 + HEADER_LABEL_HEIGHT // 2,
                         text=label,
                         fill=TEXT_COLOR,
                         font=font_spec,
-                        justify=tk.CENTER,
+                        anchor="w",
                     )
-            if query and self.filter_var.get() and not drawn:
+
+                tag = self.tags.get(str(node.path))
+                if tag and rect.width > 6 and rect.height > 6:
+                    self._draw_tag_corner(rect, tag)
+
+            if drawn_root and drawn_children == 0:
+                self._draw_empty_root_hint(width, height, query_active, raw_filter)
+            elif query_active and self.filter_var.get() and drawn_children == 0:
                 self.canvas.create_text(
                     width / 2,
                     height / 2,
-                    text=f"No results for '{self.search_var.get().strip()}'",
+                    text=f"No results for '{raw_filter}'",
                     fill=TEXT_COLOR,
                     font=("Segoe UI", 12, "bold"),
                 )
-            elif not drawn:
+            elif not drawn_root and drawn_children == 0:
                 self.canvas.create_text(
                     width / 2,
                     height / 2,
@@ -675,8 +1043,117 @@ select a different folder."""
                     fill="#a8b0c0",
                     font=("Segoe UI", 12, "bold"),
                 )
+            items = self.canvas.find_all()
+            item_count = len(items)
+            # Sample the first few items so we can see if their bboxes are
+            # actually within the canvas viewport.
+            sample_info = []
+            for item in items[:4]:
+                try:
+                    bbox = self.canvas.bbox(item)
+                    itype = self.canvas.type(item)
+                    sample_info.append(f"{itype}@{bbox}")
+                except tk.TclError:
+                    sample_info.append("?")
+            _log(
+                f"redraw: drew root={drawn_root} children={drawn_children} "
+                f"canvas_items={item_count} mapped={self.canvas.winfo_ismapped()} "
+                f"viewable={self.canvas.winfo_viewable()} "
+                f"canvas_winfo={self.canvas.winfo_width()}x{self.canvas.winfo_height()} "
+                f"canvas_rootpos={self.canvas.winfo_rootx()},{self.canvas.winfo_rooty()} "
+                f"samples={sample_info}"
+            )
+            try:
+                self.canvas.update_idletasks()
+            except tk.TclError:
+                pass
+            if item_count == 0 and self.current_node is not None:
+                _log("redraw: canvas empty after draw — scheduling retry")
+                self.root.after(150, self._retry_redraw)
         finally:
             self.is_drawing = False
+
+    def _retry_redraw(self) -> None:
+        if self.is_scanning or self.current_node is None:
+            return
+        if len(self.canvas.find_all()) == 0:
+            _log("retry_redraw: forcing redraw")
+            self.redraw()
+
+    def _draw_empty_root_hint(
+        self, width: int, height: int, query_active: bool, raw_filter: str
+    ) -> None:
+        """Explain why no child tiles are visible (permissions, hidden, empty)."""
+        node = self.current_node
+        if node is None:
+            return
+        lines: List[str] = [str(node.path), f"Total: {format_size(node.size)}"]
+
+        stats = self.last_stats
+        denied_here: List[Path] = []
+        if stats:
+            target = str(node.path)
+            for p in stats.permission_denied:
+                if str(p).startswith(target):
+                    denied_here.append(p)
+
+        # The scanner already filters hidden items out, so we probe the
+        # filesystem directly to know whether toggling 'Show hidden' would help.
+        hidden_present = False
+        if node.path.exists() and node.path.is_dir():
+            try:
+                hidden_present = any(
+                    entry.name.startswith(".") for entry in os.scandir(node.path)
+                )
+            except (PermissionError, OSError):
+                hidden_present = False
+
+        if query_active and self.filter_var.get():
+            lines.append(f"No items match filter '{raw_filter}'.")
+            lines.append("Clear the filter or uncheck 'Hide non-matching'.")
+        elif denied_here:
+            sample = ", ".join(p.name for p in denied_here[:3])
+            extra = (
+                f" (+{len(denied_here) - 3} more)" if len(denied_here) > 3 else ""
+            )
+            lines.append(f"⚠ Permission denied for {len(denied_here)} item(s): {sample}{extra}")
+            lines.append("Grant Full Disk Access in System Settings → Privacy & Security,")
+            lines.append("then click Rescan (F5).")
+        elif not node.children and hidden_present and not self.show_hidden.get():
+            lines.append("Only hidden items exist here.")
+            lines.append("Toggle 'Show hidden' above and rescan.")
+        elif not node.children:
+            lines.append("This folder is empty.")
+        else:
+            lines.append("No child tiles to draw at the current depth.")
+            lines.append("Try increasing Depth or double-clicking into a subfolder.")
+
+        self.canvas.create_text(
+            width / 2,
+            height / 2,
+            text="\n".join(lines),
+            fill="#e8edf8",
+            font=("Segoe UI", 13, "bold"),
+            justify=tk.CENTER,
+        )
+
+    def _draw_tag_corner(self, rect: Rect, tag: str) -> None:
+        """Draw a small colored triangle in the top-right corner of a tile."""
+        color = TAG_COLORS.get(tag)
+        if not color:
+            return
+        size = min(TAG_CORNER_SIZE, rect.width * 0.45, rect.height * 0.45)
+        if size < 4:
+            return
+        x_right = rect.x + rect.width
+        y_top = rect.y
+        self.canvas.create_polygon(
+            x_right - size, y_top,
+            x_right, y_top,
+            x_right, y_top + size,
+            fill=color,
+            outline="",
+        )
 
     # ------------------------------------------------------------------ mouse interaction
     def on_canvas_click(self, event: tk.Event) -> None:
@@ -729,19 +1206,29 @@ select a different folder."""
     def _node_at(self, x: int, y: int) -> Optional[DiskNode]:
         """Find the DiskNode at the given canvas coordinates.
 
-        Args:
-            x: X coordinate on canvas
-            y: Y coordinate on canvas
-
-        Returns:
-            DiskNode at the coordinates, or None if no node is found
+        Uses a small tolerance box so single-pixel tiles next to a click are
+        still selectable. ``find_overlapping`` returns items back-to-front in
+        canvas stacking order; reversing yields the topmost (smallest /
+        deepest) tile first, which is what the user usually means.
         """
-        overlapping = self.canvas.find_overlapping(x, y, x, y)
+        tolerance = 3
+        overlapping = self.canvas.find_overlapping(
+            x - tolerance, y - tolerance, x + tolerance, y + tolerance
+        )
+        # Prefer the smallest matching tile so a sub-pixel file under a large
+        # parent dir gets picked over the surrounding directory.
+        best: Optional[DiskNode] = None
+        best_area: float = float("inf")
         for item in reversed(overlapping):
             node = self.canvas_rects.get(item)
-            if node:
-                return node
-        return None
+            if node is None:
+                continue
+            rect = self.rect_geom.get(item)
+            area = rect.width * rect.height if rect else float("inf")
+            if area < best_area:
+                best = node
+                best_area = area
+        return best
 
     def _show_context_menu(self, event: tk.Event, node: DiskNode) -> None:
         """Build and show the context menu for files/folders."""
@@ -750,13 +1237,41 @@ select a different folder."""
             self.context_menu.add_command(label="Open Folder", command=lambda n=node: self._open_path(n.path))
         else:
             self.context_menu.add_command(label="Open File", command=lambda n=node: self._open_file(n.path))
-            self.context_menu.add_command(label="Reveal in Finder", command=lambda n=node: self._reveal_in_finder(n.path))
+        self.context_menu.add_command(label="Reveal in Finder", command=lambda n=node: self._reveal_in_finder(n.path))
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="Delete…", command=self.delete_selected)
+        self.context_menu.add_command(label="Rename… (F2)", command=self.rename_selected)
+        self.context_menu.add_command(label="Delete… (⌫)", command=self.delete_selected)
+        self.context_menu.add_separator()
+
+        tag_menu = tk.Menu(self.context_menu, tearoff=0)
+        current_tag = self.tags.get(str(node.path))
+        for idx, tag in enumerate(TAG_NAMES, start=1):
+            label = f"{tag.capitalize()}  (Ctrl+{idx})"
+            if current_tag == tag:
+                label = "✓ " + label
+            tag_menu.add_command(label=label, command=lambda t=tag: self.tag_selected(t))
+        tag_menu.add_separator()
+        tag_menu.add_command(label="Clear tag  (Ctrl+0)", command=lambda: self.tag_selected(None))
+        self.context_menu.add_cascade(label="Tag", menu=tag_menu)
+
         try:
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.context_menu.grab_release()
+
+    def tag_selected(self, tag: Optional[str]) -> None:
+        """Apply or clear a tag on the currently selected node."""
+        if not self.selection:
+            self.status_var.set("Select a tile first to tag it.")
+            return
+        key = str(self.selection.path)
+        if tag is None:
+            self.tags.pop(key, None)
+            self.status_var.set(f"Tag cleared: {self.selection.path.name}")
+        else:
+            self.tags[key] = tag
+            self.status_var.set(f"Tagged {self.selection.path.name} → {tag}")
+        self.redraw()
 
     def _open_path(self, path: Path) -> None:
         """Open a path using the system default handler."""
@@ -808,6 +1323,44 @@ select a different folder."""
             subprocess.run(["open", "-R", str(path)], check=False)
         except Exception as exc:
             messagebox.showerror("DiskViz", f"Failed to reveal file: {exc}")
+
+    # ------------------------------------------------------------------ rename
+    def rename_selected(self) -> None:
+        """Rename the currently selected file or directory in place."""
+        if not self.selection:
+            messagebox.showinfo("DiskViz", "Please select a file or directory to rename.")
+            return
+        target = self.selection.path
+        if not target.exists():
+            messagebox.showinfo("DiskViz", f"Path already removed: {target}")
+            self.schedule_scan()
+            return
+        new_name = simpledialog.askstring(
+            "Rename",
+            f"New name for:\n{target}",
+            initialvalue=target.name,
+            parent=self.root,
+        )
+        if not new_name or new_name == target.name:
+            return
+        if "/" in new_name or "\\" in new_name or new_name in (".", ".."):
+            messagebox.showerror("DiskViz", "Name must not contain path separators.")
+            return
+        new_path = target.with_name(new_name)
+        if new_path.exists():
+            messagebox.showerror("DiskViz", f"A path already exists at:\n{new_path}")
+            return
+        try:
+            target.rename(new_path)
+        except OSError as exc:
+            messagebox.showerror("DiskViz", f"Rename failed: {exc}")
+            return
+        # Carry the tag over to the new path so the user doesn't lose it.
+        old_key = str(target)
+        if old_key in self.tags:
+            self.tags[str(new_path)] = self.tags.pop(old_key)
+        self.status_var.set(f"Renamed → {new_path}")
+        self.schedule_scan()
 
     # ------------------------------------------------------------------ deletion
     def delete_selected(self) -> None:
@@ -898,13 +1451,18 @@ select a different folder."""
         self.monitor_job = None
         if not self.current_node:
             return
-        path_value = self.path_var.get().strip()
-        if not path_value:
+        paths = self._collect_scan_paths()
+        if not paths:
             return
         if self.scan_queue.qsize() > MAX_SCAN_QUEUE_SIZE:
             self._schedule_monitor()
             return
-        pending = _PendingScan(Path(path_value), int(self.depth_var.get()), self.follow_symlinks.get())
+        pending = _PendingScan(
+            paths=paths,
+            depth=int(self.depth_var.get()),
+            follow_symlinks=self.follow_symlinks.get(),
+            show_hidden=self.show_hidden.get(),
+        )
         self.scan_queue.put(pending)
         self._schedule_monitor()
 
@@ -915,6 +1473,82 @@ select a different folder."""
                 self.scan_queue.get_nowait()
         except queue.Empty:
             return
+
+    # ------------------------------------------------------------------ export
+    def export_report(self) -> None:
+        """Export the currently visible tree to a TXT or CSV report."""
+        if not self.current_node:
+            messagebox.showinfo("DiskViz", "Nothing to export yet — scan a directory first.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="Export report",
+            defaultextension=".txt",
+            initialfile=f"diskviz-{self.current_node.path.name or 'report'}.txt",
+            filetypes=[("Text report", "*.txt"), ("CSV", "*.csv")],
+        )
+        if not filename:
+            return
+
+        # Apply the active filter so the report mirrors what the user sees.
+        predicate, _raw, _err = self._compile_filter()
+        rows = list(self._iter_report_rows(self.current_node, predicate))
+        rows.sort(key=lambda row: row["size"], reverse=True)
+
+        try:
+            if filename.lower().endswith(".csv"):
+                self._write_csv_report(filename, rows)
+            else:
+                self._write_text_report(filename, rows)
+        except OSError as exc:
+            messagebox.showerror("DiskViz", f"Failed to export: {exc}")
+            return
+        self.status_var.set(f"Exported {len(rows)} entries → {filename}")
+
+    def _iter_report_rows(self, node: DiskNode, predicate):
+        """Yield report rows for ``node`` and all descendants matching predicate."""
+        for entry in node.iter_all():
+            if predicate is not None and not predicate(entry):
+                continue
+            yield {
+                "path": str(entry.path),
+                "size": entry.size,
+                "type": "dir" if entry.is_dir else (entry.path.suffix.lower() or "file"),
+                "tag": self.tags.get(str(entry.path), ""),
+                "modified_ns": entry.modified_ns,
+            }
+
+    def _write_csv_report(self, filename: str, rows: List[dict]) -> None:
+        with open(filename, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["path", "size_bytes", "size_human", "type", "tag", "modified_iso"])
+            for row in rows:
+                writer.writerow([
+                    row["path"],
+                    row["size"],
+                    format_size(row["size"]),
+                    row["type"],
+                    row["tag"],
+                    _format_mtime(row["modified_ns"]),
+                ])
+
+    def _write_text_report(self, filename: str, rows: List[dict]) -> None:
+        total = sum(row["size"] for row in rows)
+        with open(filename, "w", encoding="utf-8") as fh:
+            fh.write(f"DiskViz report — {self.current_node.path}\n")
+            fh.write(f"Generated: {_format_mtime(time.time_ns())}\n")
+            filter_text = self.search_var.get().strip()
+            if filter_text:
+                fh.write(f"Filter: {filter_text}\n")
+            fh.write(f"Entries: {len(rows)}    Total: {format_size(total)}\n")
+            fh.write("-" * 78 + "\n")
+            fh.write(f"{'Size':>12}  {'Tag':<6}  {'Type':<8}  Path\n")
+            fh.write("-" * 78 + "\n")
+            for row in rows:
+                fh.write(
+                    f"{format_size(row['size']):>12}  "
+                    f"{row['tag']:<6}  {row['type']:<8}  {row['path']}\n"
+                )
 
     # ------------------------------------------------------------------ run helper
 

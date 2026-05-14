@@ -9,3 +9,6 @@ dmg_tmp/
 
 # macOS
 .DS_Store
+
+# Local tool settings
+.claude/

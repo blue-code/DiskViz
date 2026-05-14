@@ -58,6 +58,51 @@ fi
 echo "✓ App bundle created"
 echo ""
 
+# Step 3.5: Inject modern Tk 8.6 so the bundled Canvas widget actually paints
+# on macOS — system Tk 8.5 has a known NSWindow flush bug that leaves the
+# canvas blank in py2app bundles.
+TCLTK_PREFIX=${TCLTK_PREFIX:-/opt/homebrew/opt/tcl-tk@8}
+APP_BUNDLE="dist/${APP_NAME}.app"
+if [ -d "$APP_BUNDLE" ] && [ -d "$TCLTK_PREFIX/lib" ]; then
+    echo -e "${BLUE}[3.5/5]${NC} Injecting Tk 8.6 from $TCLTK_PREFIX ..."
+    FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
+    RES_DIR="$APP_BUNDLE/Contents/Resources"
+    mkdir -p "$FRAMEWORKS_DIR"
+    cp -f "$TCLTK_PREFIX/lib/libtcl8.6.dylib" "$FRAMEWORKS_DIR/libtcl8.6.dylib"
+    cp -f "$TCLTK_PREFIX/lib/libtk8.6.dylib"  "$FRAMEWORKS_DIR/libtk8.6.dylib"
+    chmod +w "$FRAMEWORKS_DIR/libtcl8.6.dylib" "$FRAMEWORKS_DIR/libtk8.6.dylib"
+    install_name_tool -id "@rpath/libtcl8.6.dylib" "$FRAMEWORKS_DIR/libtcl8.6.dylib" || true
+    install_name_tool -id "@rpath/libtk8.6.dylib"  "$FRAMEWORKS_DIR/libtk8.6.dylib"  || true
+    # Tk depends on Tcl — retarget that reference too.
+    install_name_tool -change "$TCLTK_PREFIX/lib/libtcl8.6.dylib" "@rpath/libtcl8.6.dylib" \
+        "$FRAMEWORKS_DIR/libtk8.6.dylib" || true
+    # Find and retarget _tkinter.so and add an rpath for our Frameworks dir.
+    TKINTER_SO=$(find "$APP_BUNDLE" -name "_tkinter*.so" | head -n1)
+    if [ -n "$TKINTER_SO" ]; then
+        chmod +w "$TKINTER_SO"
+        install_name_tool -change /System/Library/Frameworks/Tcl.framework/Versions/8.5/Tcl \
+            "@rpath/libtcl8.6.dylib" "$TKINTER_SO" || true
+        install_name_tool -change /System/Library/Frameworks/Tk.framework/Versions/8.5/Tk \
+            "@rpath/libtk8.6.dylib" "$TKINTER_SO" || true
+        install_name_tool -add_rpath "@loader_path/../../../../Frameworks" "$TKINTER_SO" 2>/dev/null || true
+        install_name_tool -add_rpath "@executable_path/../Frameworks" "$TKINTER_SO" 2>/dev/null || true
+    fi
+    # Ship Tcl/Tk runtime scripts so the libs can find their initialization files.
+    mkdir -p "$RES_DIR/lib"
+    rm -rf "$RES_DIR/lib/tcl8.6" "$RES_DIR/lib/tk8.6"
+    cp -R "$TCLTK_PREFIX/lib/tcl8.6" "$RES_DIR/lib/tcl8.6"
+    cp -R "$TCLTK_PREFIX/lib/tk8.6"  "$RES_DIR/lib/tk8.6"
+    # Re-sign every binary we touched, then the bundle as a whole. On modern
+    # macOS, modifying a Mach-O after signing requires explicit re-sign or the
+    # OS will kill the process with SIGKILL (Code Signature Invalid).
+    codesign --force --sign - "$FRAMEWORKS_DIR/libtcl8.6.dylib" 2>/dev/null || true
+    codesign --force --sign - "$FRAMEWORKS_DIR/libtk8.6.dylib"  2>/dev/null || true
+    [ -n "$TKINTER_SO" ] && codesign --force --sign - "$TKINTER_SO" 2>/dev/null || true
+    codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
+    echo "✓ Tk 8.6 injected"
+    echo ""
+fi
+
 # Step 4: Create DMG
 echo -e "${BLUE}[4/5]${NC} Creating DMG installer..."
 

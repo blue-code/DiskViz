@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .model import DiskNode
 
@@ -55,6 +55,32 @@ class NodeRect:
     parent: Optional[DiskNode]
 
 
+HEADER_HEIGHT_PX = 14       # Strip reserved at top of every non-root rect for the label
+HEADER_INSET_PX = 2         # Padding around the inner content
+MIN_NEST_DIMENSION_PX = 14  # Stop nesting children when remaining rect is below this
+
+
+def _inner_rect(bounds: Rect, depth: int) -> Optional[Rect]:
+    """Return the rect that should contain children of a node, or None if
+    the available space is too small to nest meaningfully.
+
+    The canvas root (depth 0) gets no header — children fill the whole canvas.
+    Every level below reserves a strip at the top for its own label so the
+    SpaceSniffer-style nested look is preserved.
+    """
+    if depth == 0:
+        return bounds
+    inner = Rect(
+        bounds.x + HEADER_INSET_PX,
+        bounds.y + HEADER_HEIGHT_PX,
+        max(0.0, bounds.width - 2 * HEADER_INSET_PX),
+        max(0.0, bounds.height - HEADER_HEIGHT_PX - HEADER_INSET_PX),
+    )
+    if inner.width < MIN_NEST_DIMENSION_PX or inner.height < MIN_NEST_DIMENSION_PX:
+        return None
+    return inner
+
+
 def slice_and_dice(
     node: DiskNode,
     bounds: Rect,
@@ -62,16 +88,16 @@ def slice_and_dice(
     parent: Optional[DiskNode] = None,
     max_depth: Optional[int] = None,
 ) -> List[NodeRect]:
-    """Compute a treemap layout using the slice-and-dice algorithm.
+    """Compute a SpaceSniffer-style nested squarified treemap.
 
-    This algorithm alternates between horizontal and vertical slicing
-    at each depth level, creating rectangular regions proportional
-    to file/directory sizes.
+    Each node's bounds include a small header strip (with its label) above
+    its children, which are recursively laid out inside the remaining
+    inner rect using the squarified algorithm.
 
     Args:
         node: Root node to layout
         bounds: Available rectangle bounds
-        depth: Current tree depth (controls slice direction)
+        depth: Current tree depth (controls slice direction and header inset)
         parent: Parent node, if any
         max_depth: Maximum depth to recurse (None for entire tree)
 
@@ -82,24 +108,44 @@ def slice_and_dice(
     if not node.children or node.size <= 0 or (max_depth is not None and depth >= max_depth):
         return layouts
 
-    child_layouts = _squarify_children(node.children, bounds)
+    inner = _inner_rect(bounds, depth)
+    if inner is None:
+        return layouts
+
+    child_layouts = _squarify_children(node.children, inner, depth)
     for child, child_rect in child_layouts:
         layouts.extend(slice_and_dice(child, child_rect, depth + 1, node, max_depth))
     return layouts
 
 
-def _squarify_children(children: Sequence[DiskNode], bounds: Rect) -> List[Tuple[DiskNode, Rect]]:
-    """Compute squarified rectangles for a set of children."""
+def _squarify_children(children: Sequence[DiskNode], bounds: Rect, depth: int) -> List[Tuple[DiskNode, Rect]]:
+    """Compute squarified treemap layout (SpaceSniffer style).
+
+    Uses the squarified algorithm to create rectangles with aspect ratios
+    close to 1, making items more readable and visually balanced.
+
+    Args:
+        children: Child nodes to layout
+        bounds: Available rectangle bounds
+        depth: Current depth (not used in squarified, but kept for API consistency)
+
+    Returns:
+        List of (child, rect) tuples
+    """
     if not children:
         return []
 
+    # Sort by size (largest first) - crucial for squarified algorithm
     sorted_children = sorted(children, key=lambda c: c.size, reverse=True)
     total_size = sum(max(child.size, 1) for child in sorted_children) or 1
     total_area = bounds.width * bounds.height or 1
+
+    # Convert to (node, area) tuples for squarify algorithm
     areas = [(child, max(child.size, 1) / total_size * total_area) for child in sorted_children]
 
     result: List[Tuple[DiskNode, Rect]] = []
-    _squarify(areas, [], bounds, result, depth_limit=2000)
+    _squarify(areas, [], bounds, result, depth_limit=200)
+
     return result
 
 
@@ -110,22 +156,38 @@ def _squarify(
     acc: List[Tuple[DiskNode, Rect]],
     depth_limit: int,
 ) -> None:
-    if depth_limit <= 0:
-        # Fallback to simple slicing to prevent recursion blow-up
-        _layout_simple(items, rect, acc)
-        return
-    if not items:
-        if row:
-            _layout_row(row, rect, acc)
-        return
+    """Iterative squarify algorithm to prevent stack overflow."""
+    # Use iterative approach with explicit stack instead of recursion
+    stack: List[Tuple[Sequence[Tuple[DiskNode, float]], List[Tuple[DiskNode, float]], Rect]] = [(items, row, rect)]
 
-    first = items[0]
-    new_row = row + [first]
-    if not row or _worst_ratio(new_row, rect) <= _worst_ratio(row, rect):
-        _squarify(items[1:], new_row, rect, acc, depth_limit - 1)
-    else:
-        new_rect = _layout_row(row, rect, acc)
-        _squarify(items, [], new_rect, acc, depth_limit - 1)
+    while stack:
+        current_items, current_row, current_rect = stack.pop()
+
+        # Process items iteratively
+        while current_items:
+            if not current_row:
+                # Start a new row with first item
+                current_row = [current_items[0]]
+                current_items = current_items[1:]
+            else:
+                # Try adding next item to current row
+                if not current_items:
+                    break
+                first = current_items[0]
+                new_row = current_row + [first]
+
+                if _worst_ratio(new_row, current_rect) <= _worst_ratio(current_row, current_rect):
+                    # Adding item improves ratio, add it to row
+                    current_row = new_row
+                    current_items = current_items[1:]
+                else:
+                    # Adding item worsens ratio, layout current row and start new one
+                    current_rect = _layout_row(current_row, current_rect, acc)
+                    current_row = []
+
+        # Layout remaining row
+        if current_row:
+            _layout_row(current_row, current_rect, acc)
 
 
 def _layout_simple(
@@ -155,28 +217,35 @@ def _layout_row(
     rect: Rect,
     acc: List[Tuple[DiskNode, Rect]],
 ) -> Rect:
-    """Lay out a row either horizontally or vertically."""
+    """Lay out one squarify "row" perpendicular to the shorter side.
+
+    Canonical squarified treemap (Bruls, Huijsen, van Wijk 1999): the row is
+    placed against the shorter edge of the available rect, so each tile in the
+    row fills the full short dimension and only its long dimension varies. This
+    is what keeps tile aspect ratios close to 1 and produces the mosaic look.
+    """
     if not row:
         return rect
 
     row_area = sum(area for _, area in row)
-    horizontal = rect.width >= rect.height
-    if horizontal:
-        row_height = row_area / max(rect.width, 1e-6)
-        x = rect.x
+    if rect.width >= rect.height:
+        # Wide rect → peel a vertical column from the left, stack tiles top-to-bottom.
+        row_width = row_area / max(rect.height, 1e-6)
+        y = rect.y
         for child, area in row:
-            width = area / max(row_height, 1e-6)
-            acc.append((child, Rect(x, rect.y, width, row_height)))
-            x += width
-        return Rect(rect.x, rect.y + row_height, rect.width, max(rect.height - row_height, 0))
+            tile_height = area / max(row_width, 1e-6)
+            acc.append((child, Rect(rect.x, y, row_width, tile_height)))
+            y += tile_height
+        return Rect(rect.x + row_width, rect.y, max(rect.width - row_width, 0), rect.height)
 
-    row_width = row_area / max(rect.height, 1e-6)
-    y = rect.y
+    # Tall rect → peel a horizontal strip from the top, stack tiles left-to-right.
+    row_height = row_area / max(rect.width, 1e-6)
+    x = rect.x
     for child, area in row:
-        height = area / max(row_width, 1e-6)
-        acc.append((child, Rect(rect.x, y, row_width, height)))
-        y += height
-    return Rect(rect.x + row_width, rect.y, max(rect.width - row_width, 0), rect.height)
+        tile_width = area / max(row_height, 1e-6)
+        acc.append((child, Rect(x, rect.y, tile_width, row_height)))
+        x += tile_width
+    return Rect(rect.x, rect.y + row_height, rect.width, max(rect.height - row_height, 0))
 
 
 def _worst_ratio(row: Sequence[Tuple[DiskNode, float]], rect: Rect) -> float:
@@ -191,28 +260,26 @@ def _worst_ratio(row: Sequence[Tuple[DiskNode, float]], rect: Rect) -> float:
     return max((short_side ** 2 * max_area) / (total ** 2), (total ** 2) / (short_side ** 2 * min_area))
 
 
-def filter_layout(layouts: Sequence[NodeRect], query: str) -> Iterable[NodeRect]:
-    """Yield layout entries matching the query or having matching descendants.
+def filter_layout(
+    layouts: Sequence[NodeRect],
+    query: str,
+    predicate: Optional[Callable[[DiskNode], bool]] = None,
+) -> Iterable[NodeRect]:
+    """Yield layout entries matching the query/predicate or providing context.
 
-    The filter includes:
-    - Nodes whose path contains the query string
-    - All ancestors of matching nodes (for context)
-    - All descendants of matching directories (for context)
-
-    Args:
-        layouts: Complete treemap layout to filter
-        query: Search query (case-insensitive)
-
-    Yields:
-        NodeRect entries that match or provide context
+    When ``predicate`` is supplied it is used as the per-node test; otherwise
+    we fall back to case-insensitive substring matching against the path.
+    Ancestors and descendants of matches are preserved so context isn't lost.
     """
-    if not query:
-        yield from layouts
-        return
+    if predicate is None:
+        if not query:
+            yield from layouts
+            return
+        normalized = query.lower()
+        predicate = lambda node: normalized in str(node.path).lower()
 
-    normalized = query.lower()
     parent_map = {layout.node: layout.parent for layout in layouts}
-    matching_nodes = {layout.node for layout in layouts if normalized in str(layout.node.path).lower()}
+    matching_nodes = {layout.node for layout in layouts if predicate(layout.node)}
 
     # Include ancestors of matches.
     for node in list(matching_nodes):

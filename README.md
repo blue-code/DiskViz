@@ -4,13 +4,17 @@ DiskViz is a Python implementation of a SpaceSniffer-like disk usage explorer. I
 
 ## Features
 
-- 📁 **Treemap visualization** – slice-and-dice treemap that scales with window size and shows name/size overlays on larger tiles.
+- 📁 **Treemap visualization** – squarified treemap that scales with the window and shows name/size overlays on larger tiles.
 - 🔄 **Real-time monitoring** – background rescans keep the view in sync with file system changes.
 - 🎨 **File type colors** – configurable colors based on file type or directory status.
-- 🔍 **Search & filter** – instant highlighting plus an option to hide non-matching nodes.
-- 🗑️ **Deletion support** – delete files or entire directories (with confirmation) directly from the UI.
-- 🛠️ **Advanced controls** – adjustable scan depth, optional symlink following, and a legend to keep colors straight.
-- 🧭 **Navigation** – double-click to drill down into directories, backspace to go up, keyboard shortcuts for quick access.
+- 🔍 **Advanced filter language** – combine `*.jpg`, `|*.log` (exclude), `>1mb`, `<3months`, `:red` clauses with `;` (e.g. `*.jpg;>500kb;<1year`).
+- 🏷️ **4-color tagging** – mark files/folders with red/yellow/green/blue via `Ctrl+1..4` (clear with `Ctrl+0`) and filter by tag using `:red` etc.
+- 🗑️ **File operations** – delete and rename items (with confirmation) directly from the UI or context menu.
+- 🗂️ **Multi-volume view** – add multiple paths via **+ Add Path** to compare directories side-by-side under one treemap.
+- 👁️ **Hidden files toggle** – switch dotfiles on/off without restarting.
+- 📤 **Report export** – save the visible tree to TXT or CSV (respects the active filter).
+- 🛠️ **Advanced controls** – adjustable scan depth, optional symlink following, hidden-file inclusion.
+- 🧭 **Navigation** – double-click to drill down, backspace to go up, keyboard shortcuts for quick access.
 - 📊 **Scan statistics** – see files/directories scanned and permission-denied folders.
 - 🔐 **Permission handling** – gracefully handles restricted folders on macOS with helpful guidance.
 
@@ -36,11 +40,29 @@ python -m diskviz
 
 - `F5` - Rescan current directory
 - `F11` - Toggle fullscreen mode
+- `F2` - Rename selected item
 - `Delete` - Delete selected item
 - `Backspace` - Go up one level
 - `Home` - Reset to root view
 - `Escape` - Exit fullscreen or clear selection
+- `Ctrl+1..4` - Tag selection (red / yellow / green / blue)
+- `Ctrl+0` - Clear tag on selection
 - `Ctrl+Q` - Quit application
+
+### Filter Language
+
+Type into the **Filter** box. Combine clauses with `;` (all must match):
+
+| Example | Meaning |
+|---|---|
+| `*.jpg` or `*.{jpg,png}` | Keep matching files (glob on basename) |
+| `\|*.log` | Exclude matching files |
+| `>1mb`, `<500kb`, `>=2gb` | Size comparison (B/KB/MB/GB/TB) |
+| `>2years`, `<3months`, `<7d` | Modification age (s/m/h/d/w/mo/y) |
+| `:red` / `:yellow` / `:green` / `:blue` | Tagged items only |
+| `:tagged` / `:all` | Any tagged item |
+| `foo` | Plain substring on full path |
+| `*.jpg;>500kb;<1year` | Big-ish recent JPEGs |
 
 > ⚠️ **Deletion is permanent.** Ensure you have backups before deleting files.
 
