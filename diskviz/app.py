@@ -15,11 +15,12 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from .colors import FILE_TYPE_COLORS, classify_path
 from .filters import FilterError, TAG_NAMES, build_predicate
 from .model import DiskNode
-from .scanner import ScanStats, flatten_snapshot, scan_many
+from .scanner import ScanStats, attach_free_space, flatten_snapshot, scan_many
 from .treemap import NodeRect, Rect, filter_layout, slice_and_dice
 
 # UI Constants
@@ -65,7 +66,13 @@ TAG_COLORS = {
     "blue": "#2F80ED",
 }
 TAG_CORNER_SIZE = 14
-FILTER_HINT = "e.g. *.jpg;>1mb;<3months  |  :red  |  |*.log"
+FILTER_HINT = (
+    "e.g. *.jpg;*.png;>1mb  |  \\temp;<3months  |  :class:audio  |  "
+    ":tag:red+green-blue"
+)
+# Free-space synthetic node uses this suffix so we can spot it everywhere.
+FREE_SPACE_SUFFIX = " [Free space]"
+FREE_SPACE_COLOR = "#5A5F6B"
 
 
 def check_directory_access(path: Path) -> tuple[bool, str]:
@@ -150,6 +157,34 @@ def _log(message: str) -> None:
             fh.write(f"{time.strftime('%H:%M:%S')} {message}\n")
     except OSError:
         pass
+
+
+def _format_age(modified_ns: int, now_ns: Optional[int] = None) -> str:
+    """Render an mtime-to-now delta as ``"1 year 3 months"``-style text."""
+    if modified_ns <= 0:
+        return ""
+    if now_ns is None:
+        now_ns = time.time_ns()
+    seconds = max(0, (now_ns - modified_ns) // 1_000_000_000)
+    if seconds < 60:
+        return f"{seconds}s"
+    units = [
+        ("y", 365 * 86400),
+        ("mo", 30 * 86400),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60),
+    ]
+    parts: List[str] = []
+    remaining = seconds
+    for suffix, divisor in units:
+        if remaining >= divisor:
+            n = remaining // divisor
+            remaining -= n * divisor
+            parts.append(f"{int(n)}{suffix}")
+            if len(parts) == 2:
+                break
+    return " ".join(parts) if parts else f"{seconds}s"
 
 
 def _format_mtime(modified_ns: int) -> str:
@@ -240,6 +275,24 @@ class DiskVizApp:
         self.tags: Dict[str, str] = {}
         self.last_stats: Optional[ScanStats] = None
 
+        # SpaceSniffer-style view options
+        self.file_class_style = tk.BooleanVar(value=False)
+        self.show_free_space = tk.BooleanVar(value=False)
+
+        # Zoom history (browser-style back/forward)
+        self.history: List[Path] = []
+        self.history_idx: int = -1
+
+        # User-controlled detail level. None = unlimited (default).
+        self.detail_level: Optional[int] = None
+
+        # Hover halo: nodes whose outline gets brightened on mouse-over.
+        self.hover_chain: List[DiskNode] = []
+        self.hover_chain_key: Tuple[int, ...] = ()
+        self._hover_redraw_pending: bool = False
+
+        self._filter_warnings_seen: set = set()
+
         self._setup_ui()
         self.monitor_job: Optional[str] = None
         self.scan_queue: "queue.Queue[_PendingScan]" = queue.Queue()
@@ -301,6 +354,21 @@ class DiskVizApp:
             top_frame, text="Show hidden", variable=self.show_hidden, command=self.schedule_scan
         )
         hidden_box.grid(row=0, column=8, padx=(0, 8))
+
+        # View-style toggles (SpaceSniffer parity)
+        ttk.Checkbutton(
+            top_frame,
+            text="Color by type",
+            variable=self.file_class_style,
+            command=self.redraw,
+        ).grid(row=0, column=9, padx=(0, 8))
+
+        ttk.Checkbutton(
+            top_frame,
+            text="Free space",
+            variable=self.show_free_space,
+            command=self._toggle_free_space,
+        ).grid(row=0, column=10, padx=(0, 8))
 
         ttk.Label(top_frame, text="Filter:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         search_entry = ttk.Entry(top_frame, textvariable=self.search_var)
@@ -424,8 +492,7 @@ select a different folder."""
         self.root.bind("<F11>", lambda e: self.toggle_fullscreen())
         # Delete - Delete selected
         self.root.bind("<Delete>", lambda e: self.delete_selected())
-        # Backspace - Go up one level
-        self.root.bind("<BackSpace>", lambda e: self.go_up())
+        # Backspace handled below — see history navigation.
         # Home - Reset to root view
         self.root.bind("<Home>", lambda e: self.reset_view())
         # Ctrl+F - Focus search
@@ -442,6 +509,23 @@ select a different folder."""
         self.root.bind("<Control-Key-3>", lambda e: self.tag_selected("green"))
         self.root.bind("<Control-Key-4>", lambda e: self.tag_selected("blue"))
         self.root.bind("<Control-Key-0>", lambda e: self.tag_selected(None))
+
+        # View / navigation bindings
+        self.root.bind("<Control-t>", lambda e: self._toggle_var(self.file_class_style))
+        self.root.bind("<Control-e>", lambda e: self._toggle_free_space_var())
+        # Backspace now walks zoom history (forward via Shift+Backspace).
+        # The "Up ↑" toolbar button still calls go_up() directly.
+        self.root.bind("<BackSpace>", lambda e: self.history_back())
+        self.root.bind("<Shift-BackSpace>", lambda e: self.history_forward())
+        # Detail level: Ctrl + / - / 9 (restore unlimited).
+        self.root.bind("<Control-plus>", lambda e: self.adjust_detail(+1))
+        self.root.bind("<Control-equal>", lambda e: self.adjust_detail(+1))
+        self.root.bind("<Command-equal>", lambda e: self.adjust_detail(+1))
+        self.root.bind("<Control-minus>", lambda e: self.adjust_detail(-1))
+        self.root.bind("<Command-minus>", lambda e: self.adjust_detail(-1))
+        self.root.bind("<Control-Key-9>", lambda e: self.adjust_detail(None))
+        # Ctrl+N reopens the start picker.
+        self.root.bind("<Control-n>", lambda e: self._reopen_picker())
 
     def _on_first_appear(self) -> None:
         """Activate the app and prompt for a folder if none is set."""
@@ -466,6 +550,99 @@ select a different folder."""
             # forcing process-level activation (which can prematurely
             # dismiss the dialog).
             self.root.after(200, self.choose_directory)
+
+    # -------------------------------------------------- view-state toggles
+    def _toggle_var(self, var: tk.BooleanVar) -> None:
+        """Flip a BooleanVar and trigger an immediate redraw."""
+        var.set(not var.get())
+        self.redraw()
+
+    def _toggle_free_space_var(self) -> None:
+        self.show_free_space.set(not self.show_free_space.get())
+        self._toggle_free_space()
+
+    def _toggle_free_space(self) -> None:
+        """User toggled the Free space checkbox — re-apply on current tree."""
+        if self.root_node is None:
+            return
+        self._apply_free_space(self.root_node)
+        self.redraw()
+
+    def _apply_free_space(self, root: DiskNode) -> None:
+        """Attach or detach the synthetic free-space child of ``root``."""
+        # Remove any existing synthetic node first so the toggle is idempotent.
+        before = len(root.children)
+        root.children = [
+            child for child in root.children
+            if not child.path.name.endswith(FREE_SPACE_SUFFIX)
+        ]
+        if len(root.children) != before:
+            root.size = sum(child.size for child in root.children) or root.size
+
+        if self.show_free_space.get():
+            attach_free_space(root)
+
+        root.children.sort(key=lambda n: n.size, reverse=True)
+
+    # -------------------------------------------------- history navigation
+    def _push_history(self, path: Path) -> None:
+        # Truncate any "forward" entries when the user diverges from history.
+        self.history = self.history[: self.history_idx + 1]
+        if self.history and self.history[-1] == path:
+            return
+        self.history.append(path)
+        self.history_idx = len(self.history) - 1
+
+    def history_back(self) -> None:
+        if self.history_idx <= 0:
+            return
+        self.history_idx -= 1
+        self._navigate_to_history()
+
+    def history_forward(self) -> None:
+        if self.history_idx + 1 >= len(self.history):
+            return
+        self.history_idx += 1
+        self._navigate_to_history()
+
+    def _navigate_to_history(self) -> None:
+        if self.root_node is None or self.history_idx < 0:
+            return
+        target = self.history[self.history_idx]
+        node = self.root_node.find_by_path(target)
+        if node is None:
+            # Folder may have disappeared after a rescan — fall back to root.
+            node = self.root_node
+        self.current_node = node
+        self.selection = None
+        self._update_info_bar(node)
+        self.status_var.set(
+            f"Viewing {node.path} — {format_size(node.size)} "
+            f"(history {self.history_idx + 1}/{len(self.history)})"
+        )
+        self.redraw()
+
+    # -------------------------------------------------- detail level
+    def adjust_detail(self, delta: Optional[int]) -> None:
+        """Bump or reset the user-controlled treemap depth.
+
+        ``delta`` is +1 / -1; ``None`` restores the default (unlimited).
+        """
+        if delta is None:
+            self.detail_level = None
+            self.status_var.set("Detail level: unlimited")
+        else:
+            current = self.detail_level or 4
+            new = max(1, min(20, current + delta))
+            self.detail_level = new
+            self.status_var.set(f"Detail level: {new}")
+        self.redraw()
+
+    # -------------------------------------------------- picker re-entry
+    def _reopen_picker(self) -> None:
+        if self.is_scanning:
+            return
+        self.choose_directory()
 
     def toggle_fullscreen(self) -> None:
         """Toggle fullscreen mode."""
@@ -765,6 +942,16 @@ select a different folder."""
             prior_view_path = self.current_node.path
 
         self.root_node = node  # Store the scan root
+        # Re-attach the synthetic [Free space] child if the toggle is on so
+        # the user keeps seeing it after each periodic rescan.
+        if self.show_free_space.get():
+            self._apply_free_space(self.root_node)
+        # Seed zoom history on the very first scan so Backspace works
+        # before the user has drilled down at all.
+        if not self.history:
+            self.history = [node.path]
+            self.history_idx = 0
+        self._filter_warnings_seen.clear()
         if prior_view_path is not None:
             match = node.find_by_path(prior_view_path)
             self.current_node = match if match is not None else node
@@ -901,7 +1088,16 @@ select a different folder."""
         search_match: bool,
         query_active: bool,
     ) -> tuple[str, str]:
-        base = DIR_TILE_BASE if node.is_dir else FILE_TILE_BASE
+        # Synthetic "free space" node always renders in neutral gray so it's
+        # visually distinct from real folders/files.
+        if node.path.name.endswith(FREE_SPACE_SUFFIX):
+            return lighten(FREE_SPACE_COLOR, 0.20), darken(FREE_SPACE_COLOR, 0.20)
+
+        if self.file_class_style.get() and not node.is_dir:
+            kind = classify_path(node.path, node.is_dir)
+            base = FILE_TYPE_COLORS.get(kind, FILE_TILE_BASE)
+        else:
+            base = DIR_TILE_BASE if node.is_dir else FILE_TILE_BASE
         shade = min(max(depth - 1, 0), 3) * DEPTH_SHADE_FACTOR
         fill_factor = max(0.05, NORMAL_LIGHTEN_FACTOR - shade)
         fill = lighten(base, fill_factor)
@@ -927,12 +1123,24 @@ select a different folder."""
         if not raw:
             return None, "", None
         try:
-            predicate = build_predicate(raw, self.tags)
+            predicate = build_predicate(
+                raw,
+                self.tags,
+                file_classifier=classify_path,
+                on_warning=self._record_filter_warning,
+            )
         except FilterError as exc:
             return None, raw, str(exc)
         except Exception as exc:  # pragma: no cover - defensive
             return None, raw, str(exc)
         return predicate, raw, None
+
+    def _record_filter_warning(self, message: str) -> None:
+        """Surface a filter-engine warning in the status bar without spamming."""
+        if message in self._filter_warnings_seen:
+            return
+        self._filter_warnings_seen.add(message)
+        self.status_var.set(f"⚠ filter: {message}")
 
     def redraw(self) -> None:
         """Redraw the treemap visualization on the canvas."""
@@ -953,10 +1161,12 @@ select a different folder."""
             self.canvas.delete("all")
             self.canvas_rects.clear()
             self.rect_geom.clear()
+            # Honor the user's manual detail-level override if set.
+            depth_cap = self.detail_level if self.detail_level is not None else VISIBLE_DEPTH
             self.current_layout = slice_and_dice(
                 self.current_node,
                 Rect(0, 0, width, height),
-                max_depth=VISIBLE_DEPTH,
+                max_depth=depth_cap,
             )
             _log(f"redraw: layout entries={len(self.current_layout)}")
 
@@ -996,16 +1206,37 @@ select a different folder."""
                     continue
                 fill_color, outline = self._tile_colors(node, layout.depth, bool(is_match), bool(query_active))
                 is_selected = node is self.selection
+                is_hovered = node in self.hover_chain
                 # Integer coords for crisp rendering on the bundled Tk build.
                 x1 = int(round(rect.x))
                 y1 = int(round(rect.y))
                 x2 = int(round(rect.x + rect.width))
                 y2 = int(round(rect.y + rect.height))
+                # Drop-shadow under the selected tile so it pops out of
+                # deeply-nested layouts (SpaceSniffer-style cue).
+                if is_selected and rect.width > 6 and rect.height > 6:
+                    shadow_color = "#000000"
+                    self.canvas.create_rectangle(
+                        x1 + 1, y1 + 1, x2 + 2, y2 + 2,
+                        fill=shadow_color, outline="",
+                    )
+                    self.canvas.create_rectangle(
+                        x1 + 2, y1 + 2, x2 + 3, y2 + 3,
+                        fill=shadow_color, outline="",
+                    )
                 # A thicker bright border on the selected tile mimics
                 # SpaceSniffer's selection frame so the user can see exactly
-                # which deeply-nested item they're on.
-                border_width = 3 if is_selected else 1
-                border_color = SELECTION_COLOR if is_selected else outline
+                # which deeply-nested item they're on. Hover halo brightens
+                # the outline of every ancestor in the chain.
+                if is_selected:
+                    border_color = SELECTION_COLOR
+                    border_width = 3
+                elif is_hovered:
+                    border_color = lighten(outline, 0.55)
+                    border_width = 2
+                else:
+                    border_color = outline
+                    border_width = 1
                 item = self.canvas.create_rectangle(
                     x1, y1, x2, y2,
                     fill=fill_color,
@@ -1189,12 +1420,46 @@ select a different folder."""
         self.redraw()
 
     def on_canvas_motion(self, event: tk.Event) -> None:
-        """Handle mouse motion to show tooltip information."""
+        """Handle mouse motion: tooltip + SpaceSniffer-style halo chain."""
         node = self._node_at(event.x, event.y)
         if node:
-            self.tooltip_var.set(f"{node.path} — {format_size(node.size)}")
+            mtime_text = _format_mtime(node.modified_ns)
+            age_text = _format_age(node.modified_ns)
+            extras = []
+            if mtime_text:
+                extras.append(f"modified {mtime_text}")
+            if age_text:
+                extras.append(f"({age_text} ago)")
+            suffix = " — " + " ".join(extras) if extras else ""
+            self.tooltip_var.set(
+                f"{node.path} — {format_size(node.size)}{suffix}"
+            )
         else:
             self.tooltip_var.set("")
+
+        # Build the ancestor chain of the hovered node so redraw can
+        # highlight each level of nesting.
+        chain: List[DiskNode] = []
+        if node is not None and self.root_node is not None:
+            current = node
+            while current is not None:
+                chain.append(current)
+                if current is self.root_node:
+                    break
+                current = self._find_parent(self.root_node, current)
+        new_key = tuple(id(n) for n in chain)
+        if new_key == self.hover_chain_key:
+            return
+        self.hover_chain = chain
+        self.hover_chain_key = new_key
+        # Throttle: schedule at most one redraw per idle tick.
+        if not self._hover_redraw_pending:
+            self._hover_redraw_pending = True
+            self.root.after_idle(self._consume_hover_redraw)
+
+    def _consume_hover_redraw(self) -> None:
+        self._hover_redraw_pending = False
+        self.redraw()
 
     def on_canvas_double_click(self, event: tk.Event) -> None:
         """Handle double-click to zoom into directories.
@@ -1206,9 +1471,18 @@ select a different folder."""
         node = self._node_at(event.x, event.y)
         if not node:
             return
+        # Free-space synthetic tile is not a real directory — only select.
+        if node.path.name.endswith(FREE_SPACE_SUFFIX):
+            self.selection = node
+            self.tooltip_var.set(
+                f"Free space: {format_size(node.size)}"
+            )
+            self.redraw()
+            return
         if node.is_dir:
             self.current_node = node
             self.selection = None
+            self._push_history(node.path)
             self.status_var.set(f"Viewing {node.path} — {format_size(node.size)}")
             self._update_info_bar(node)
             self.redraw()

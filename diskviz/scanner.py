@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
 from .model import DiskNode
+
+FREE_SPACE_NAME_SUFFIX = " [Free space]"
 
 
 # System directories and files to skip during scanning
@@ -182,6 +185,38 @@ def scan_many(
         children,
     )
     return synthetic, stats
+
+
+def attach_free_space(root: DiskNode) -> None:
+    """Append a synthetic ``[Free space]`` child to ``root`` if applicable.
+
+    The node represents the free byte count of the filesystem that owns
+    ``root``. We use a name with a recognisable suffix so the rest of the
+    app can guard rename/delete/drill-down against it. If we cannot stat
+    the filesystem (e.g. ``root`` is a virtual synthetic root from
+    ``scan_many``) the call is a no-op.
+    """
+    try:
+        usage = shutil.disk_usage(root.path)
+    except (FileNotFoundError, PermissionError, OSError):
+        return
+
+    free = int(usage.free)
+    if free <= 0:
+        return
+
+    synthetic = DiskNode(
+        path=root.path / FREE_SPACE_NAME_SUFFIX.lstrip(),  # not used for IO
+        size=free,
+        is_dir=False,
+        modified_ns=int(time.time_ns()),
+        children=[],
+    )
+    # Mark via the path suffix so callers can identify the synthetic node by
+    # name alone without needing a separate flag on DiskNode.
+    object.__setattr__(synthetic, "path", Path(str(root.path) + FREE_SPACE_NAME_SUFFIX))
+    root.children.append(synthetic)
+    root.size += free
 
 
 def flatten_snapshot(node: DiskNode) -> Iterable[Tuple[Path, int, int]]:
