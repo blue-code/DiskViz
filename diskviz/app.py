@@ -1197,7 +1197,12 @@ select a different folder."""
             self.tooltip_var.set("")
 
     def on_canvas_double_click(self, event: tk.Event) -> None:
-        """Handle double-click to zoom into directories."""
+        """Handle double-click to zoom into directories.
+
+        Viewer-only behavior: double-clicking a file does NOT open it
+        (which would trigger iCloud downloads or launch the default app).
+        It only selects the tile so the user can inspect details.
+        """
         node = self._node_at(event.x, event.y)
         if not node:
             return
@@ -1208,7 +1213,11 @@ select a different folder."""
             self._update_info_bar(node)
             self.redraw()
         else:
-            self._open_file(node.path)
+            self.selection = node
+            self.tooltip_var.set(
+                f"Selected: {node.path} ({format_size(node.size)})"
+            )
+            self.redraw()
 
     def on_canvas_right_click(self, event: tk.Event) -> None:
         """Display a context menu for the clicked node."""
@@ -1249,13 +1258,17 @@ select a different folder."""
         return best
 
     def _show_context_menu(self, event: tk.Event, node: DiskNode) -> None:
-        """Build and show the context menu for files/folders."""
+        """Build and show the context menu for files/folders.
+
+        Viewer-only: no "Open File" action — that would trigger iCloud
+        downloads or launch the file's default app. Reveal in Finder is
+        kept because it only navigates Finder, never reads file content.
+        """
         self.context_menu.delete(0, tk.END)
-        if node.is_dir:
-            self.context_menu.add_command(label="Open Folder", command=lambda n=node: self._open_path(n.path))
-        else:
-            self.context_menu.add_command(label="Open File", command=lambda n=node: self._open_file(n.path))
-        self.context_menu.add_command(label="Reveal in Finder", command=lambda n=node: self._reveal_in_finder(n.path))
+        self.context_menu.add_command(
+            label="Reveal in Finder",
+            command=lambda n=node: self._reveal_in_finder(n.path),
+        )
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Rename… (F2)", command=self.rename_selected)
         self.context_menu.add_command(label="Delete… (⌫)", command=self.delete_selected)
@@ -1290,42 +1303,6 @@ select a different folder."""
             self.tags[key] = tag
             self.status_var.set(f"Tagged {self.selection.path.name} → {tag}")
         self.redraw()
-
-    def _open_path(self, path: Path) -> None:
-        """Open a path using the system default handler."""
-        import platform
-
-        if not path.exists():
-            messagebox.showerror("DiskViz", f"Path does not exist: {path}")
-            return
-        try:
-            system = platform.system()
-            if system == "Darwin":
-                subprocess.run(["open", str(path)], check=False)
-            elif system == "Windows":
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            else:
-                subprocess.run(["xdg-open", str(path)], check=False)
-        except Exception as exc:
-            messagebox.showerror("DiskViz", f"Failed to open: {exc}")
-
-    def _open_file(self, path: Path) -> None:
-        """Open a file with the default application."""
-        import platform
-
-        if not path.exists():
-            messagebox.showerror("DiskViz", f"Path does not exist: {path}")
-            return
-        try:
-            system = platform.system()
-            if system == "Darwin":
-                subprocess.run(["open", str(path)], check=False)
-            elif system == "Windows":
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            else:
-                subprocess.run(["xdg-open", str(path)], check=False)
-        except Exception as exc:
-            messagebox.showerror("DiskViz", f"Failed to open file: {exc}")
 
     def _reveal_in_finder(self, path: Path) -> None:
         """Reveal the file in Finder (macOS only)."""
