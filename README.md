@@ -42,27 +42,41 @@ python -m diskviz
 - `F11` - Toggle fullscreen mode
 - `F2` - Rename selected item
 - `Delete` - Delete selected item
-- `Backspace` - Go up one level
+- `Backspace` - Zoom history: back
+- `Shift+Backspace` - Zoom history: forward
 - `Home` - Reset to root view
 - `Escape` - Exit fullscreen or clear selection
+- `Ctrl+N` - Reopen the folder picker (start dialog)
+- `Ctrl+T` - Toggle color-by-file-type
+- `Ctrl+E` - Toggle free-space synthetic tile (drive scans only)
+- `Ctrl++` / `Ctrl+=` / `Cmd+=` - Detail level +1 (deeper nesting)
+- `Ctrl+-` / `Cmd+-` - Detail level -1
+- `Ctrl+9` - Reset detail level to unlimited
 - `Ctrl+1..4` - Tag selection (red / yellow / green / blue)
 - `Ctrl+0` - Clear tag on selection
 - `Ctrl+Q` - Quit application
 
 ### Filter Language
 
-Type into the **Filter** box. Combine clauses with `;` (all must match):
+Type into the **Filter** box. Combine clauses with `;`. Tokens of the same
+kind are **OR**-ed together; different kinds (e.g. glob vs size) and
+exclude tokens are **AND**-ed.
 
 | Example | Meaning |
 |---|---|
 | `*.jpg` or `*.{jpg,png}` | Keep matching files (glob on basename) |
 | `\|*.log` | Exclude matching files |
+| `\temp` | Keep files inside a folder named `temp` (any depth) |
+| `\|\node_modules` | Exclude everything under `node_modules` |
 | `>1mb`, `<500kb`, `>=2gb` | Size comparison (B/KB/MB/GB/TB) |
 | `>2years`, `<3months`, `<7d` | Modification age (s/m/h/d/w/mo/y) |
-| `:red` / `:yellow` / `:green` / `:blue` | Tagged items only |
+| `c>1year`, `a<3months` | Creation / access age (fallbacks to modify for now, with a status-bar warning) |
+| `:class:audio` | File-type class filter (image/video/audio/archive/document/code/binary) |
+| `:red` / `:yellow` / `:green` / `:blue` | Single tag |
+| `:tag:red+green-blue` | Multi-tag combo (must be red OR green AND NOT blue) |
 | `:tagged` / `:all` | Any tagged item |
 | `foo` | Plain substring on full path |
-| `*.jpg;>500kb;<1year` | Big-ish recent JPEGs |
+| `*.jpg;*.png;>500kb;<1year` | Big-ish recent JPEGs/PNGs |
 
 > ⚠️ **Deletion is permanent.** Ensure you have backups before deleting files.
 
