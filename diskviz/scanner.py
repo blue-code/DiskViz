@@ -56,6 +56,7 @@ def scan_directory(
     max_depth: int = 4,
     follow_symlinks: bool = False,
     show_hidden: bool = False,
+    skip_zero_size: bool = True,
 ) -> Tuple[DiskNode, ScanStats]:
     """Build a DiskNode tree representing disk usage starting at root.
 
@@ -64,13 +65,16 @@ def scan_directory(
         max_depth: Maximum depth to recurse into subdirectories
         follow_symlinks: Whether to follow symbolic links
         show_hidden: Whether to include dotfiles / hidden entries
+        skip_zero_size: Drop files reporting zero bytes (SpaceSniffer behaviour)
 
     Returns:
         Tuple of (DiskNode tree, ScanStats with collection statistics)
     """
     root = root.expanduser().resolve()
     stats = ScanStats()
-    node = _scan_node(root, 0, max_depth, follow_symlinks, show_hidden, stats)
+    node = _scan_node(
+        root, 0, max_depth, follow_symlinks, show_hidden, skip_zero_size, stats
+    )
     return node, stats
 
 
@@ -80,6 +84,7 @@ def _scan_node(
     max_depth: int,
     follow_symlinks: bool,
     show_hidden: bool,
+    skip_zero_size: bool,
     stats: ScanStats,
 ) -> DiskNode:
     """Recursively scan a single filesystem node.
@@ -122,8 +127,13 @@ def _scan_node(
                     continue
                 child_path = Path(entry.path)
                 child_node = _scan_node(
-                    child_path, depth + 1, max_depth, follow_symlinks, show_hidden, stats
+                    child_path, depth + 1, max_depth, follow_symlinks, show_hidden,
+                    skip_zero_size, stats
                 )
+                # SpaceSniffer hides zero-byte files because they'd occupy
+                # zero pixels in a proportional treemap. Still keep folders.
+                if skip_zero_size and not child_node.is_dir and child_node.size <= 0:
+                    continue
                 size += child_node.size
                 mtime = max(mtime, child_node.modified_ns)
                 children.append(child_node)
@@ -149,6 +159,7 @@ def scan_many(
     max_depth: int = 4,
     follow_symlinks: bool = False,
     show_hidden: bool = False,
+    skip_zero_size: bool = True,
 ) -> Tuple[DiskNode, ScanStats]:
     """Scan multiple roots and merge them under a synthetic ``Volumes`` node.
 
@@ -161,13 +172,17 @@ def scan_many(
         empty = DiskNode(Path("∅"), 0, True, int(time.time_ns()), [])
         return empty, stats
     if len(paths) == 1:
-        return scan_directory(paths[0], max_depth, follow_symlinks, show_hidden)
+        return scan_directory(
+            paths[0], max_depth, follow_symlinks, show_hidden, skip_zero_size
+        )
 
     children: List[DiskNode] = []
     total_size = 0
     max_mtime = 0
     for path in paths:
-        child, child_stats = scan_directory(path, max_depth, follow_symlinks, show_hidden)
+        child, child_stats = scan_directory(
+            path, max_depth, follow_symlinks, show_hidden, skip_zero_size
+        )
         children.append(child)
         total_size += child.size
         max_mtime = max(max_mtime, child.modified_ns)
