@@ -17,11 +17,18 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional, Tuple
 
-from .colors import FILE_TYPE_COLORS, classify_path
+from .colors import (
+    FILE_TYPE_COLORS,
+    classify_path,
+    load_user_classes,
+    make_classifier,
+)
 from .filters import FilterError, TAG_NAMES, build_predicate
 from .model import DiskNode
 from .scanner import ScanStats, attach_free_space, flatten_snapshot, scan_many
+from .snapshot import Snapshot, load_snapshot, save_snapshot
 from .treemap import NodeRect, Rect, filter_layout, slice_and_dice
+from .watcher import PathWatcher
 
 # UI Constants
 DEFAULT_WINDOW_SIZE = "1100x700"
@@ -144,6 +151,7 @@ class _PendingScan:
     depth: int
     follow_symlinks: bool
     show_hidden: bool = False
+    skip_zero_size: bool = True
 
 
 _LOG_PATH = Path("~/Library/Logs/DiskViz.log").expanduser()
@@ -259,6 +267,7 @@ class DiskVizApp:
         self.depth_var = tk.IntVar(value=DEFAULT_SCAN_DEPTH)
         self.follow_symlinks = tk.BooleanVar(value=False)
         self.show_hidden = tk.BooleanVar(value=False)
+        self.skip_zero_size = tk.BooleanVar(value=True)
         self.filter_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="💡 Select a folder below or use Quick Access buttons for safe directories")
 
@@ -292,6 +301,19 @@ class DiskVizApp:
         self._hover_redraw_pending: bool = False
 
         self._filter_warnings_seen: set = set()
+
+        # User-defined file classes augment FILE_TYPE_COLORS.
+        user_colors, ext_map = load_user_classes()
+        self.user_class_colors: Dict[str, str] = user_colors
+        self.classifier = make_classifier(ext_map) if ext_map else classify_path
+
+        # Snapshot context — non-empty when the current view came from a
+        # loaded .diskviz.json file rather than a live scan.
+        self.snapshot_source: Optional[Path] = None
+
+        # Native FS event watcher. Falls back to polling when unavailable.
+        self.watcher = PathWatcher()
+        self._watcher_rescan_job: Optional[str] = None
 
         self._setup_ui()
         self.monitor_job: Optional[str] = None
@@ -370,6 +392,13 @@ class DiskVizApp:
             command=self._toggle_free_space,
         ).grid(row=0, column=10, padx=(0, 8))
 
+        ttk.Checkbutton(
+            top_frame,
+            text="Skip 0-byte",
+            variable=self.skip_zero_size,
+            command=self.schedule_scan,
+        ).grid(row=0, column=11, padx=(0, 8))
+
         ttk.Label(top_frame, text="Filter:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         search_entry = ttk.Entry(top_frame, textvariable=self.search_var)
         search_entry.grid(row=1, column=1, sticky="we", padx=(4, 4), pady=(6, 0))
@@ -394,6 +423,8 @@ class DiskVizApp:
         ttk.Button(btn_frame, text="Delete", command=self.delete_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Rename", command=self.rename_selected, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Export…", command=self.export_report, width=9).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Save Snap", command=self.save_snapshot_dialog, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Load Snap", command=self.load_snapshot_dialog, width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="⛶", command=self.toggle_fullscreen, width=3).pack(side=tk.LEFT, padx=2)
 
         top_frame.columnconfigure(1, weight=1)
@@ -829,12 +860,15 @@ select a different folder."""
                     self._show_permission_help()
                 return
 
+        # A live scan overrides any loaded snapshot, so clear that context.
+        self.snapshot_source = None
         self._clear_pending_scans()
         pending = _PendingScan(
             paths=paths,
             depth=int(self.depth_var.get()),
             follow_symlinks=self.follow_symlinks.get(),
             show_hidden=self.show_hidden.get(),
+            skip_zero_size=self.skip_zero_size.get(),
         )
         self.scan_queue.put(pending)
         if len(paths) == 1:
@@ -859,6 +893,7 @@ select a different folder."""
                     max_depth=pending.depth,
                     follow_symlinks=pending.follow_symlinks,
                     show_hidden=pending.show_hidden,
+                    skip_zero_size=pending.skip_zero_size,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 self.root.after(0, lambda e=exc: self._on_scan_failure(e))
@@ -985,7 +1020,45 @@ select a different folder."""
         snapshot = tuple(sorted((str(path), size, mtime) for path, size, mtime in flatten_snapshot(node)))
         self.snapshot_hash = hash(snapshot)
         self.redraw()
+        self._start_watcher()
         self._schedule_monitor()
+
+    # -------------------------------------------------- live FS watcher
+    def _start_watcher(self) -> None:
+        """Watch the scanned paths with native FS events when possible."""
+        if not self.watcher.available:
+            return
+        paths = self._collect_scan_paths()
+        if not paths:
+            return
+        self.watcher.start(paths, self._on_filesystem_change)
+
+    def _on_filesystem_change(self) -> None:
+        """Callback from the watcher thread — debounce into a UI rescan."""
+        # ``after`` is thread-safe and the only Tk API we should use from
+        # the watchdog thread. Chain through to schedule_scan on the main
+        # loop after a quiet period so bursts collapse into one scan.
+        try:
+            self.root.after(0, self._debounced_rescan)
+        except RuntimeError:
+            # Mainloop already torn down — ignore.
+            pass
+
+    def _debounced_rescan(self) -> None:
+        if self._watcher_rescan_job is not None:
+            try:
+                self.root.after_cancel(self._watcher_rescan_job)
+            except tk.TclError:
+                pass
+        self._watcher_rescan_job = self.root.after(
+            400, self._fire_debounced_rescan
+        )
+
+    def _fire_debounced_rescan(self) -> None:
+        self._watcher_rescan_job = None
+        if self.snapshot_source is not None:
+            return
+        self.schedule_scan()
 
     # ------------------------------------------------------------------ drawing
     def _truncate_label(self, text: str, max_length: int = 28) -> str:
@@ -1094,8 +1167,14 @@ select a different folder."""
             return lighten(FREE_SPACE_COLOR, 0.20), darken(FREE_SPACE_COLOR, 0.20)
 
         if self.file_class_style.get() and not node.is_dir:
-            kind = classify_path(node.path, node.is_dir)
-            base = FILE_TYPE_COLORS.get(kind, FILE_TILE_BASE)
+            kind = self.classifier(node.path, node.is_dir)
+            # User palette overrides built-ins; fall back to defaults; final
+            # fallback is the plain file colour so unknown classes still draw.
+            base = (
+                self.user_class_colors.get(kind)
+                or FILE_TYPE_COLORS.get(kind)
+                or FILE_TILE_BASE
+            )
         else:
             base = DIR_TILE_BASE if node.is_dir else FILE_TILE_BASE
         shade = min(max(depth - 1, 0), 3) * DEPTH_SHADE_FACTOR
@@ -1126,7 +1205,7 @@ select a different folder."""
             predicate = build_predicate(
                 raw,
                 self.tags,
-                file_classifier=classify_path,
+                file_classifier=self.classifier,
                 on_warning=self._record_filter_warning,
             )
         except FilterError as exc:
@@ -1293,6 +1372,7 @@ select a different folder."""
                     font=("Segoe UI", 12, "bold"),
                 )
             items = self.canvas.find_all()
+            self._draw_viewable_bar(width, height)
             item_count = len(items)
             # Sample the first few items so we can see if their bboxes are
             # actually within the canvas viewport.
@@ -1328,6 +1408,35 @@ select a different folder."""
         if len(self.canvas.find_all()) == 0:
             _log("retry_redraw: forcing redraw")
             self.redraw()
+
+    def _draw_viewable_bar(self, canvas_w: int, canvas_h: int) -> None:
+        """Vertical bar on the left edge showing the share of total disk
+        currently visible (SpaceSniffer §5.12).
+
+        The bar's filled height is proportional to
+        ``current_node.size / root_node.size``. When the user is at the
+        root the bar fills the full canvas height; drill-down shrinks it.
+        """
+        if self.root_node is None or self.current_node is None:
+            return
+        total = self.root_node.size
+        if total <= 0:
+            return
+        ratio = max(0.0, min(1.0, self.current_node.size / total))
+        bar_w = 4
+        bar_h = int(round(canvas_h * ratio))
+        if bar_h <= 0:
+            bar_h = 1
+        # Subtle: a dark track + a brighter fill so the bar reads even on
+        # the default dark canvas background.
+        self.canvas.create_rectangle(
+            0, 0, bar_w, canvas_h,
+            fill="#222633", outline="",
+        )
+        self.canvas.create_rectangle(
+            0, canvas_h - bar_h, bar_w, canvas_h,
+            fill="#5BC0BE", outline="",
+        )
 
     def _draw_empty_root_hint(
         self, width: int, height: int, query_active: bool, raw_filter: str
@@ -1720,6 +1829,13 @@ select a different folder."""
         self.monitor_job = None
         if not self.current_node:
             return
+        # Snapshots are frozen-in-time — never overwrite them with a fresh scan.
+        if self.snapshot_source is not None:
+            return
+        # Native FS event watcher handles change detection; we only poll
+        # when watchdog isn't available (non-macOS, missing dependency...).
+        if self.watcher.available:
+            return
         paths = self._collect_scan_paths()
         if not paths:
             return
@@ -1731,6 +1847,7 @@ select a different folder."""
             depth=int(self.depth_var.get()),
             follow_symlinks=self.follow_symlinks.get(),
             show_hidden=self.show_hidden.get(),
+            skip_zero_size=self.skip_zero_size.get(),
         )
         self.scan_queue.put(pending)
         self._schedule_monitor()
@@ -1742,6 +1859,68 @@ select a different folder."""
                 self.scan_queue.get_nowait()
         except queue.Empty:
             return
+
+    # ------------------------------------------------------------------ snapshot
+    def save_snapshot_dialog(self) -> None:
+        """Persist the current scan tree to a portable JSON snapshot."""
+        if self.root_node is None:
+            messagebox.showinfo("DiskViz", "Scan something first, then save.")
+            return
+        default_name = self.root_node.path.name or "diskviz"
+        filename = filedialog.asksaveasfilename(
+            title="Save snapshot",
+            defaultextension=".diskviz.json",
+            initialfile=f"{default_name}.diskviz.json",
+            filetypes=[("DiskViz snapshot", "*.diskviz.json"), ("JSON", "*.json")],
+        )
+        if not filename:
+            return
+        try:
+            save_snapshot(
+                Path(filename),
+                self.root_node,
+                self.tags,
+                created_iso=_format_mtime(time.time_ns()),
+            )
+        except OSError as exc:
+            messagebox.showerror("DiskViz", f"Failed to save snapshot: {exc}")
+            return
+        self.status_var.set(f"Saved snapshot → {filename}")
+
+    def load_snapshot_dialog(self) -> None:
+        """Open a snapshot file and replace the current view with it."""
+        filename = filedialog.askopenfilename(
+            title="Open snapshot",
+            filetypes=[("DiskViz snapshot", "*.diskviz.json"), ("JSON", "*.json")],
+        )
+        if not filename:
+            return
+        try:
+            snapshot = load_snapshot(Path(filename))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("DiskViz", f"Failed to load snapshot: {exc}")
+            return
+        self.apply_snapshot(snapshot, Path(filename))
+
+    def apply_snapshot(self, snapshot: Snapshot, source: Path) -> None:
+        """Swap the current view to a loaded snapshot."""
+        self.is_scanning = False
+        self._stop_scan_overlay()
+        self.root_node = snapshot.root
+        self.current_node = snapshot.root
+        self.tags = dict(snapshot.tags)
+        self.selection = None
+        self.snapshot_source = source
+        self.history = [snapshot.root.path]
+        self.history_idx = 0
+        self.path_var.set(str(snapshot.root.path))
+        self.status_var.set(
+            f"Loaded snapshot {source.name} — {format_size(snapshot.root.size)}"
+            f" (frozen in time)"
+        )
+        self._update_info_bar(snapshot.root)
+        self._filter_warnings_seen.clear()
+        self.redraw()
 
     # ------------------------------------------------------------------ export
     def export_report(self) -> None:
