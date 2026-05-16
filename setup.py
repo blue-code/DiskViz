@@ -23,7 +23,7 @@ _existing_frameworks = [p for p in _CANDIDATE_FRAMEWORKS if Path(p).exists()]
 
 OPTIONS = {
     'argv_emulation': False,
-    'packages': ['diskviz'],
+    'packages': ['diskviz', 'watchdog'],
     # Only bundle explicit frameworks if they exist on this machine; otherwise
     # py2app falls back to whatever Tcl/Tk the active interpreter uses.
     **({'frameworks': _existing_frameworks} if _existing_frameworks else {}),
@@ -47,8 +47,8 @@ OPTIONS = {
         'CFBundleDisplayName': 'DiskViz',
         'CFBundleGetInfoString': 'Disk usage visualizer for macOS',
         'CFBundleIdentifier': 'com.diskviz.app',
-        'CFBundleVersion': '1.2.0',
-        'CFBundleShortVersionString': '1.2.0',
+        'CFBundleVersion': '1.3.0',
+        'CFBundleShortVersionString': '1.3.0',
         'NSHumanReadableCopyright': 'Copyright © 2025. All rights reserved.',
         'NSHighResolutionCapable': True,
     },

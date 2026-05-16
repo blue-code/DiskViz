@@ -17,6 +17,11 @@ DiskViz is a Python implementation of a SpaceSniffer-like disk usage explorer. I
 - 🧭 **Navigation** – double-click to drill down, backspace to go up, keyboard shortcuts for quick access.
 - 📊 **Scan statistics** – see files/directories scanned and permission-denied folders.
 - 🔐 **Permission handling** – gracefully handles restricted folders on macOS with helpful guidance.
+- 💾 **Snapshots** – save the scan tree (and tags) to `.diskviz.json`, reload it later or share with others.
+- 🖥️ **CLI mode** – `python -m diskviz --scan PATH --save out.diskviz.json --autoclose` runs headless for scripts and CI.
+- 🛰️ **Live FS events** – `watchdog`-based real-time refresh on macOS (replaces the 5s poller when available).
+- 📐 **Viewable percent bar** – left-edge bar shows how much of the total disk is currently shown.
+- 🎨 **Custom file classes** – extend the color palette via `~/.diskviz/file_classes.json` (extensions → class → color).
 
 ## Requirements
 
@@ -25,8 +30,31 @@ DiskViz only depends on the Python standard library. Tkinter ships with most Pyt
 ## Usage
 
 ```bash
+# Interactive GUI
 python -m diskviz
+
+# Headless: scan + snapshot + export CSV with a filter
+python -m diskviz --scan /Volumes/SSD --filter '*.jpg;>1mb' \
+    --save snap.diskviz.json --export-csv jpegs.csv --autoclose
+
+# Load a previously-saved snapshot
+python -m diskviz --load snap.diskviz.json
 ```
+
+### CLI flags
+
+| Flag | Meaning |
+|---|---|
+| `--scan PATH` | Scan PATH on launch (repeatable for multiple roots). |
+| `--load FILE` | Load a `.diskviz.json` snapshot instead. |
+| `--filter EXPR` | Apply a filter expression after scan/load. |
+| `--save DEST` | Save the resulting tree to a snapshot at DEST. |
+| `--export-txt DEST` / `--export-csv DEST` | Write a report at DEST. |
+| `--depth N` | Maximum scan depth (default: 4). |
+| `--show-hidden` | Include dotfiles. |
+| `--follow-symlinks` | Follow symbolic links. |
+| `--include-zero` | Show zero-byte files (hidden by default). |
+| `--autoclose` | Run headlessly without opening a window. |
 
 1. Click **Browse** to choose a directory.
 2. Adjust scan depth or enable symlink following if needed.
