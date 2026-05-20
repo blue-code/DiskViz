@@ -65,7 +65,7 @@ def scan_directory(
         max_depth: Maximum depth to recurse into subdirectories
         follow_symlinks: Whether to follow symbolic links
         show_hidden: Whether to include dotfiles / hidden entries
-        skip_zero_size: Drop files reporting zero bytes (SpaceSniffer behaviour)
+        skip_zero_size: Drop files reporting zero bytes
 
     Returns:
         Tuple of (DiskNode tree, ScanStats with collection statistics)
@@ -130,8 +130,8 @@ def _scan_node(
                     child_path, depth + 1, max_depth, follow_symlinks, show_hidden,
                     skip_zero_size, stats
                 )
-                # SpaceSniffer hides zero-byte files because they'd occupy
-                # zero pixels in a proportional treemap. Still keep folders.
+                # Hide zero-byte files: they'd occupy zero pixels in a
+                # proportional treemap. Still keep folders.
                 if skip_zero_size and not child_node.is_dir and child_node.size <= 0:
                     continue
                 size += child_node.size

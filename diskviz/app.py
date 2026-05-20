@@ -1,4 +1,4 @@
-"""Tkinter application providing a SpaceSniffer-like interface."""
+"""Tkinter application providing the DiskViz treemap interface."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ DEFAULT_SCAN_DEPTH = 4
 MONITOR_INTERVAL_MS = 5000
 MAX_SCAN_QUEUE_SIZE = 2
 
-# Canvas & palette constants (SpaceSniffer style)
+# Canvas & palette constants
 CANVAS_BG_COLOR = "#0E1018"
 RECT_INSET_PADDING = 1.0
 MIN_LABEL_WIDTH = 40  # 더 작은 블록에도 레이블 표시
@@ -54,18 +54,18 @@ TEXT_COLOR = "#1A1A1A"  # 약간 더 진한 텍스트로 가독성 향상
 NORMAL_LIGHTEN_FACTOR = 0.30  # 더 밝고 선명한 색상
 SEARCH_LIGHTEN_FACTOR = 0.45
 DEPTH_SHADE_FACTOR = 0.08  # 깊이에 따른 색상 대비 강화
-# SpaceSniffer-style nested rendering: render the whole hierarchy at once
-# (children inside parents) and let MIN_NEST_DIMENSION_PX in treemap.py stop
-# the recursion when the inner space is too small.
+# Nested rendering: draw the whole hierarchy at once (children inside parents)
+# and let MIN_NEST_DIMENSION_PX in treemap.py stop the recursion when the
+# inner space is too small.
 VISIBLE_DEPTH: Optional[int] = None
 HEADER_LABEL_HEIGHT = 14  # must match treemap.HEADER_HEIGHT_PX
 
 # Tiles smaller than this on either side are skipped — too small to perceive
-# or click reliably, and they only clutter the canvas. SpaceSniffer behaves
-# similarly: very thin items collapse into the parent rectangle.
+# or click reliably, and they only clutter the canvas. Very thin items
+# collapse into the parent rectangle.
 MIN_VISIBLE_TILE_PX = 2
 
-# 4-color tag palette (Ctrl+1~4) – matches SpaceSniffer convention
+# 4-color tag palette (Ctrl+1~4)
 TAG_COLORS = {
     "red": "#E03B3B",
     "yellow": "#F2C94C",
@@ -259,7 +259,7 @@ class DiskVizApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("DiskViz - SpaceSniffer for Python")
+        self.root.title("DiskViz")
         self.root.geometry(DEFAULT_WINDOW_SIZE)
 
         self.path_var = tk.StringVar()
@@ -284,7 +284,7 @@ class DiskVizApp:
         self.tags: Dict[str, str] = {}
         self.last_stats: Optional[ScanStats] = None
 
-        # SpaceSniffer-style view options
+        # View options (color-by-type, synthetic free-space tile)
         self.file_class_style = tk.BooleanVar(value=False)
         self.show_free_space = tk.BooleanVar(value=False)
 
@@ -377,7 +377,7 @@ class DiskVizApp:
         )
         hidden_box.grid(row=0, column=8, padx=(0, 8))
 
-        # View-style toggles (SpaceSniffer parity)
+        # View-style toggles
         ttk.Checkbutton(
             top_frame,
             text="Color by type",
@@ -1112,7 +1112,7 @@ select a different folder."""
         return f"{name}\n[{parent_display}]\n{size_text}"
 
     def _format_header_label(self, node: DiskNode, width: float) -> str:
-        """SpaceSniffer-style 'name - size' header, truncated to fit."""
+        """'name - size' header label, truncated to fit."""
         size_text = format_size(node.size)
         suffix = "/" if node.is_dir else ""
         # Roughly 7px/char @ 10pt; budget for the size suffix and dash.
@@ -1180,7 +1180,7 @@ select a different folder."""
         shade = min(max(depth - 1, 0), 3) * DEPTH_SHADE_FACTOR
         fill_factor = max(0.05, NORMAL_LIGHTEN_FACTOR - shade)
         fill = lighten(base, fill_factor)
-        # 더 미세한 경계선 - SpaceSniffer 스타일
+        # 더 미세한 경계선 스타일
         outline = darken(base, max(0.08, 0.25 - shade * 0.3))
 
         if query_active:
@@ -1292,7 +1292,7 @@ select a different folder."""
                 x2 = int(round(rect.x + rect.width))
                 y2 = int(round(rect.y + rect.height))
                 # Drop-shadow under the selected tile so it pops out of
-                # deeply-nested layouts (SpaceSniffer-style cue).
+                # deeply-nested layouts.
                 if is_selected and rect.width > 6 and rect.height > 6:
                     shadow_color = "#000000"
                     self.canvas.create_rectangle(
@@ -1303,10 +1303,9 @@ select a different folder."""
                         x1 + 2, y1 + 2, x2 + 3, y2 + 3,
                         fill=shadow_color, outline="",
                     )
-                # A thicker bright border on the selected tile mimics
-                # SpaceSniffer's selection frame so the user can see exactly
-                # which deeply-nested item they're on. Hover halo brightens
-                # the outline of every ancestor in the chain.
+                # A thicker bright border on the selected tile so the user
+                # can see exactly which deeply-nested item they're on. Hover
+                # halo brightens the outline of every ancestor in the chain.
                 if is_selected:
                     border_color = SELECTION_COLOR
                     border_width = 3
@@ -1329,9 +1328,9 @@ select a different folder."""
                 else:
                     drawn_children += 1
 
-                # SpaceSniffer-style label: "name - size" at the TOP-LEFT of
-                # the rect, inside the header strip we reserved. This way each
-                # parent's title sits above its nested children.
+                # Header label "name - size" at the TOP-LEFT of the rect,
+                # inside the reserved header strip. This way each parent's
+                # title sits above its nested children.
                 if layout.depth > 0 and rect.width >= 36 and rect.height >= 16:
                     label = self._format_header_label(node, rect.width)
                     font_size = self._header_font_size(rect.width, rect.height)
@@ -1411,7 +1410,7 @@ select a different folder."""
 
     def _draw_viewable_bar(self, canvas_w: int, canvas_h: int) -> None:
         """Vertical bar on the left edge showing the share of total disk
-        currently visible (SpaceSniffer §5.12).
+        currently visible.
 
         The bar's filled height is proportional to
         ``current_node.size / root_node.size``. When the user is at the
@@ -1529,7 +1528,7 @@ select a different folder."""
         self.redraw()
 
     def on_canvas_motion(self, event: tk.Event) -> None:
-        """Handle mouse motion: tooltip + SpaceSniffer-style halo chain."""
+        """Handle mouse motion: tooltip + ancestor halo chain."""
         node = self._node_at(event.x, event.y)
         if node:
             mtime_text = _format_mtime(node.modified_ns)

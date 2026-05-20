@@ -66,7 +66,7 @@ def _inner_rect(bounds: Rect, depth: int) -> Optional[Rect]:
 
     The canvas root (depth 0) gets no header — children fill the whole canvas.
     Every level below reserves a strip at the top for its own label so the
-    SpaceSniffer-style nested look is preserved.
+    nested treemap look is preserved.
     """
     if depth == 0:
         return bounds
@@ -88,7 +88,7 @@ def slice_and_dice(
     parent: Optional[DiskNode] = None,
     max_depth: Optional[int] = None,
 ) -> List[NodeRect]:
-    """Compute a SpaceSniffer-style nested squarified treemap.
+    """Compute a nested squarified treemap.
 
     Each node's bounds include a small header strip (with its label) above
     its children, which are recursively laid out inside the remaining
@@ -119,7 +119,7 @@ def slice_and_dice(
 
 
 def _squarify_children(children: Sequence[DiskNode], bounds: Rect, depth: int) -> List[Tuple[DiskNode, Rect]]:
-    """Compute squarified treemap layout (SpaceSniffer style).
+    """Compute squarified treemap layout.
 
     Uses the squarified algorithm to create rectangles with aspect ratios
     close to 1, making items more readable and visually balanced.

@@ -28,7 +28,7 @@ NC='\033[0m' # No Color
 
 # Configuration
 APP_NAME="DiskViz"
-VERSION="1.3.0"
+VERSION="1.3.1"
 DMG_NAME="DiskViz-${VERSION}"
 DMG_TITLE="DiskViz ${VERSION}"
 

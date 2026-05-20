@@ -62,7 +62,7 @@ def _log_launch_exception(exc: BaseException) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="diskviz",
-        description="DiskViz — SpaceSniffer-style disk usage explorer.",
+        description="DiskViz — treemap-based disk usage explorer.",
     )
     parser.add_argument(
         "--scan", action="append", default=[], metavar="PATH",
@@ -102,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--include-zero", action="store_true",
-        help="Include zero-byte files (hidden by default, SpaceSniffer §4.2).",
+        help="Include zero-byte files (hidden by default).",
     )
     parser.add_argument(
         "--autoclose", action="store_true",

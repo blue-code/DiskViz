@@ -1,6 +1,6 @@
 # DiskViz
 
-DiskViz is a Python implementation of a SpaceSniffer-like disk usage explorer. It visualizes directory structures as a treemap, monitors changes in real time, and lets you search, filter, and delete items from an intuitive Tkinter interface.
+DiskViz is a Python disk usage explorer. It visualizes directory structures as a treemap, monitors changes in real time, and lets you search, filter, and delete items from an intuitive Tkinter interface.
 
 ## Features
 

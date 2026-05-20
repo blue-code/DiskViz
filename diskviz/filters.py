@@ -1,6 +1,6 @@
 """Advanced filter language for DiskViz.
 
-SpaceSniffer-style mini-language. Combine clauses with ``;``:
+Mini-language for matching files in the treemap. Combine clauses with ``;``:
 
 - ``*.jpg`` / ``*.{jpg,png}``      — keep matching file names
 - ``|*.jpg``                       — exclude matching files
@@ -15,7 +15,7 @@ SpaceSniffer-style mini-language. Combine clauses with ``;``:
 - ``:class:audio``                 — match by file-type class
 - anything else                    — case-insensitive substring on the path
 
-Grouping rules (same as SpaceSniffer):
+Grouping rules:
 
 - Tokens of the same kind (glob, tag, class) are **OR**-ed together.
 - Different kinds (e.g. glob vs size) are **AND**-ed together.

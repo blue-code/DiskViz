@@ -1,4 +1,4 @@
-"""DiskViz package providing a SpaceSniffer-like disk usage visualizer."""
+"""DiskViz package providing a disk usage visualizer."""
 
 from .app import DiskVizApp, run_app
 
